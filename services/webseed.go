@@ -146,9 +146,11 @@ func (s *Web) handleGetRequest(c *gin.Context, hash, rangeHeader, id, path strin
 	}
 	c.Status(status)
 
-	if _, err := io.Copy(c.Writer, out.Body); err != nil {
+	n, err := io.Copy(c.Writer, out.Body)
+	if err != nil {
 		log.WithError(err).WithField("id", id).WithField("path", path).Warn("webseed stream error")
 	}
+	log.WithField("id", id).WithField("path", path).WithField("bytes", n).Debug("webseed stream finished")
 }
 
 func (s *Web) buildRangePointer(rangeHeader string) *string {
