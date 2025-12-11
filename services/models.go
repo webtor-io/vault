@@ -76,7 +76,6 @@ type File struct {
 	Status     Status    `json:"status" pg:"status,use_zero"`
 	TotalSize  int64     `json:"total_size" pg:"total_size,notnull,default:0"`
 	StoredSize int64     `json:"stored_size" pg:"stored_size,notnull,default:0"`
-	Path       *string   `json:"path,omitempty" pg:"path"`
 	CreatedAt  time.Time `json:"created_at" pg:"created_at,notnull,default:now()"`
 	UpdatedAt  time.Time `json:"updated_at" pg:"updated_at,notnull,default:now()"`
 

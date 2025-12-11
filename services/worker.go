@@ -126,7 +126,7 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 	err := db.Model(&list).
 		Context(ctx).
 		Where("status != ?", StatusStored).
-		Where("now() - updated_at > interval '10 seconds'").
+		Where("now() - updated_at > interval '30 seconds'").
 		Select()
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
 		return err
@@ -145,10 +145,12 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 func (s *Worker) processResource(ctx context.Context, db *pg.DB, r Resource) error {
 	var processingStatus Status
 	switch r.Status {
-	case StatusQueuedForDeletion:
+	case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
 		processingStatus = StatusDeleting
-	case StatusQueuedForStoring:
+	case StatusQueuedForStoring, StatusStoring, StatusStoreError:
 		processingStatus = StatusStoring
+	default:
+		return fmt.Errorf("unexpected resource status: %s", r.Status)
 	}
 	return db.RunInTransaction(s.ctx, func(tx *pg.Tx) error {
 		// lock row only if it is still queued for deletion
@@ -244,6 +246,8 @@ func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 			return
 		}
 		log.WithField("id", j.id).Info("deleted successfully")
+	default:
+		return fmt.Errorf("unexpected job status: %s", j.status)
 	}
 	return
 }
@@ -278,6 +282,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		Set("total_size = 0").
 		Set("stored_size = 0").
 		Set("updated_at = now()").
+		Set("error = null").
 		Where("resource_id = ?", id).
 		Update(); err != nil {
 		return err
@@ -441,18 +446,26 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, errors.New("s3 bucket is not configured")
 	}
 	db := s.pg.Get()
-	f := &File{
-		TotalSize: item.Size,
-		Path:      &item.PathStr,
-		Status:    StatusStoring,
-	}
-	err := db.Model(f).Context(ctx).Where("total_size = ? AND path = ?", item.Size, item.PathStr, StatusStored).Select()
+	// Try to find an already stored file by matching resource_file.path and file.total_size
+	// This allows deduplication by common path and size across resources
+	var existing File
+	err := db.Model(&existing).
+		Context(ctx).
+		Column("file.*").
+		Join("JOIN resource_file AS rf ON rf.file_hash = file.hash").
+		Where("rf.path = ?", item.PathStr).
+		Where("file.total_size = ?", item.Size).
+		Where("file.status = ?", StatusStored).
+		Limit(1).
+		Select()
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
 		return nil, err
 	}
-	if err == nil && (f.Status == StatusStored || f.UpdatedAt.Add(10*time.Second).After(time.Now())) {
-		return f, nil
+	if err == nil {
+		// Found a suitable file that's already stored
+		return &existing, nil
 	}
+	// No existing stored file found by path+size, proceed with exporting and storing by content hash
 	ei, err := s.api.ExportResourceContent(ctx, cla, id, item.ID)
 	if err != nil {
 		return nil, err
@@ -464,7 +477,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, err
 	}
 	log.WithField("hash", hash).Debug("generated hash")
-	f.Hash = hash
+	// Prepare file model
+	f := &File{
+		Hash:      hash,
+		TotalSize: item.Size,
+		Status:    StatusStoring,
+	}
 	err = db.Model(f).
 		Context(ctx).
 		WherePK().
