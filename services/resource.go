@@ -29,7 +29,7 @@ func (s *Web) putResource(c *gin.Context) {
 		_ = c.Error(err)
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"resource": res})
+	c.JSON(http.StatusAccepted, res)
 }
 
 // GET /resource/{id}
@@ -57,7 +57,7 @@ func (s *Web) getResource(c *gin.Context) {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"resource": res})
+	c.JSON(http.StatusOK, res)
 }
 
 // DELETE /resource/{id} — queue deletion
@@ -84,5 +84,5 @@ func (s *Web) deleteResource(c *gin.Context) {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"resource": res})
+	c.JSON(http.StatusAccepted, res)
 }
