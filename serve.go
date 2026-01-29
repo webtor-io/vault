@@ -18,6 +18,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = services.RegisterWebFlags(c.Flags)
 	c.Flags = services.RegisterWorkerFlags(c.Flags)
 	c.Flags = services.RegisterApiFlags(c.Flags)
+	c.Flags = services.RegisterNATSFlags(c.Flags)
 }
 
 func makeServeCMD() cli.Command {
@@ -74,8 +75,14 @@ func serve(c *cli.Context) (err error) {
 	// Setting Webtor Rest API
 	api := services.NewApi(c, cl)
 
+	// Setting NATS
+	nt := services.NewNATS(c)
+	if nt != nil {
+		defer nt.Close()
+	}
+
 	// Setting Worker
-	worker := services.NewWorker(c, pg, s3c, api)
+	worker := services.NewWorker(c, pg, s3c, api, nt)
 	svcs = append(svcs, worker)
 	defer worker.Close()
 

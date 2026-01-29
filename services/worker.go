@@ -47,6 +47,7 @@ type Worker struct {
 	nwrks  int
 	api    *Api
 	bucket string
+	nats   *NATS
 }
 
 const (
@@ -76,7 +77,7 @@ type job struct {
 	id     string
 }
 
-func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api) *Worker {
+func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *NATS) *Worker {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	w := &Worker{
@@ -88,6 +89,7 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api) *Worker {
 		jobs:   make(chan job, 1024),
 		api:    api,
 		bucket: c.String(awsBucketFlag),
+		nats:   nt,
 	}
 	// start worker pool
 	for i := 0; i < w.nwrks; i++ {
@@ -238,6 +240,12 @@ func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 			return
 		}
 		log.WithField("id", j.id).Info("stored successfully")
+		if s.nats != nil {
+			err = s.nats.Publish("resource.vaulted", map[string]string{"resource_id": j.id})
+			if err != nil {
+				log.WithError(err).WithField("id", j.id).Error("failed to publish nats message")
+			}
+		}
 	case StatusDeleting:
 		log.WithField("id", j.id).Info("deleting started")
 		if err = s.handleDelete(ctx, db, j.id); err != nil {
