@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -47,7 +48,7 @@ type Worker struct {
 	nwrks  int
 	api    *Api
 	bucket string
-	nats   *NATS
+	nats   *cs.NATS
 }
 
 const (
@@ -77,7 +78,7 @@ type job struct {
 	id     string
 }
 
-func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *NATS) *Worker {
+func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NATS) *Worker {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	w := &Worker{
@@ -241,9 +242,13 @@ func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 		}
 		log.WithField("id", j.id).Info("stored successfully")
 		if s.nats != nil {
-			err = s.nats.Publish("resource.vaulted", map[string]string{"resource_id": j.id})
-			if err != nil {
-				log.WithError(err).WithField("id", j.id).Error("failed to publish nats message")
+			nc := s.nats.Get()
+			if nc != nil {
+				b, _ := json.Marshal(map[string]string{"resource_id": j.id})
+				err = nc.Publish("resource.vaulted", b)
+				if err != nil {
+					log.WithError(err).WithField("id", j.id).Error("failed to publish nats message")
+				}
 			}
 		}
 	case StatusDeleting:

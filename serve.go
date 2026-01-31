@@ -18,7 +18,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = services.RegisterWebFlags(c.Flags)
 	c.Flags = services.RegisterWorkerFlags(c.Flags)
 	c.Flags = services.RegisterApiFlags(c.Flags)
-	c.Flags = services.RegisterNATSFlags(c.Flags)
+	c.Flags = cs.RegisterNATSFlags(c.Flags)
 }
 
 func makeServeCMD() cli.Command {
@@ -76,7 +76,7 @@ func serve(c *cli.Context) (err error) {
 	api := services.NewApi(c, cl)
 
 	// Setting NATS
-	nt := services.NewNATS(c)
+	nt := cs.NewNATS(c)
 	if nt != nil {
 		defer nt.Close()
 	}

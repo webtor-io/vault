@@ -15,7 +15,7 @@ require (
 	github.com/swaggo/gin-swagger v1.6.1
 	github.com/swaggo/swag v1.16.6
 	github.com/urfave/cli v1.22.17
-	github.com/webtor-io/common-services v0.0.0-20251108105453-635ef47a01ea
+	github.com/webtor-io/common-services v0.0.0-20260131122210-5178e4b36a70
 	github.com/webtor-io/rest-api v1.0.1-0.20251127161136-aabd09b63999
 )
 
