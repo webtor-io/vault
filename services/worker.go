@@ -48,12 +48,16 @@ type Worker struct {
 	nwrks  int
 	api    *Api
 	bucket string
+	concur int
+	part   int64
 	nats   *cs.NATS
 }
 
 const (
-	workerCountFlag = "workers"
-	awsBucketFlag   = "aws-bucket"
+	workerCountFlag          = "workers"
+	awsBucketFlag            = "aws-bucket"
+	awsUploadConcurrencyFlag = "aws-upload-concurrency"
+	awsUploadPartSizeFlag    = "aws-upload-part-size"
 )
 
 // RegisterWorkerFlags registers CLI flags for the worker service.
@@ -69,6 +73,18 @@ func RegisterWorkerFlags(f []cli.Flag) []cli.Flag {
 			Name:   awsBucketFlag,
 			Usage:  "aws bucket",
 			EnvVar: "AWS_BUCKET",
+		},
+		cli.IntFlag{
+			Name:   awsUploadConcurrencyFlag,
+			Usage:  "aws upload concurrency",
+			Value:  10,
+			EnvVar: "AWS_UPLOAD_CONCURRENCY",
+		},
+		cli.Int64Flag{
+			Name:   awsUploadPartSizeFlag,
+			Usage:  "aws upload part size",
+			Value:  1024 * 1024 * 1024,
+			EnvVar: "AWS_UPLOAD_PART_SIZE",
 		},
 	)
 }
@@ -90,6 +106,8 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NAT
 		jobs:   make(chan job, 1024),
 		api:    api,
 		bucket: c.String(awsBucketFlag),
+		concur: c.Int(awsUploadConcurrencyFlag),
+		part:   c.Int64(awsUploadPartSizeFlag),
 		nats:   nt,
 	}
 	// start worker pool
@@ -571,7 +589,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		},
 	}
 	// Upload stream directly to S3 under the file hash key using s3manager (supports io.Reader)
-	uploader := s3manager.NewUploaderWithClient(s3Cl)
+	uploader := s3manager.NewUploaderWithClient(s3Cl, func(u *s3manager.Uploader) {
+		u.Concurrency = s.concur
+		u.PartSize = s.part
+	})
 	_, err = uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(hash),
