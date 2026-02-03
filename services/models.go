@@ -55,8 +55,8 @@ type Resource struct {
 
 	ID         string    `json:"resource_id" pg:"resource_id,pk"`
 	Status     Status    `json:"status" pg:"status,use_zero"`
-	TotalSize  int64     `json:"total_size" pg:"total_size,notnull,default:0"`
-	StoredSize int64     `json:"stored_size" pg:"stored_size,notnull,default:0"`
+	TotalSize  int64     `json:"total_size" pg:"total_size,notnull,use_zero,default:0"`
+	StoredSize int64     `json:"stored_size" pg:"stored_size,notnull,use_zero,default:0"`
 	Error      *string   `json:"error,omitempty" pg:"error"`
 	CreatedAt  time.Time `json:"created_at" pg:"created_at,notnull,default:now()"`
 	UpdatedAt  time.Time `json:"updated_at" pg:"updated_at,notnull,default:now()"`
@@ -75,9 +75,9 @@ type File struct {
 	Hash       string    `json:"hash" pg:"hash,pk"`
 	Status     Status    `json:"status" pg:"status,use_zero"`
 	UploadID   string    `json:"upload_id" pg:"upload_id"`
-	PartSize   int64     `json:"part_size" pg:"part_size,notnull,default:0"`
-	TotalSize  int64     `json:"total_size" pg:"total_size,notnull,default:0"`
-	StoredSize int64     `json:"stored_size" pg:"stored_size,notnull,default:0"`
+	PartSize   int64     `json:"part_size" pg:"part_size,notnull,use_zero,default:0"`
+	TotalSize  int64     `json:"total_size" pg:"total_size,notnull,use_zero,default:0"`
+	StoredSize int64     `json:"stored_size" pg:"stored_size,notnull,use_zero,default:0"`
 	CreatedAt  time.Time `json:"created_at" pg:"created_at,notnull,default:now()"`
 	UpdatedAt  time.Time `json:"updated_at" pg:"updated_at,notnull,default:now()"`
 
