@@ -125,27 +125,33 @@ func (s *Worker) Serve() error {
 
 func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 	// 1. Get all resources queued for storing or deletion in one request
+	// Using FOR UPDATE SKIP LOCKED to avoid multiple workers picking up the same resource
 	var list []Resource
-	err := db.Model(&list).
-		Context(ctx).
-		Where("status != ?", StatusStored).
-		Where("now() - updated_at > interval '30 seconds'").
-		Select()
-	if err != nil && !errors.Is(err, pg.ErrNoRows) {
-		return err
-	}
-	// 2. For each resource handle atomically with SELECT FOR UPDATE to avoid races
-	for _, r := range list {
-		if err := s.processResource(ctx, db, r); err != nil {
-			log.WithError(err).WithField("id", r.ID).Error("process resource failed")
-			continue
+	err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
+		err := tx.Model(&list).
+			Context(ctx).
+			Where("status != ?", StatusStored).
+			Where("now() - updated_at > interval '1 minute'").
+			For("UPDATE SKIP LOCKED").
+			Select()
+		if err != nil && !errors.Is(err, pg.ErrNoRows) {
+			return err
 		}
-		//log.WithField("id", r.ID).Info("processed resource")
+		for _, r := range list {
+			if err := s.processResource(ctx, tx, r); err != nil {
+				log.WithError(err).WithField("id", r.ID).Error("process resource failed")
+				continue
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func (s *Worker) processResource(ctx context.Context, db *pg.DB, r Resource) error {
+func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) error {
 	var processingStatus Status
 	switch r.Status {
 	case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
@@ -155,33 +161,31 @@ func (s *Worker) processResource(ctx context.Context, db *pg.DB, r Resource) err
 	default:
 		return fmt.Errorf("unexpected resource status: %s", r.Status)
 	}
-	return db.RunInTransaction(s.ctx, func(tx *pg.Tx) error {
-		// lock row only if it is still queued for deletion
-		cur := &Resource{}
-		// For update with status check avoids taking rows already processed
-		err := tx.Model(cur).
-			Context(ctx).
-			Where("resource_id = ?", r.ID).
-			Where("updated_at = ?", r.UpdatedAt).
-			For("UPDATE").
-			Select()
-		if err != nil {
-			if errors.Is(err, pg.ErrNoRows) {
-				return nil
-			}
-			return err
+
+	// For update with status check avoids taking rows already processed
+	cur := &Resource{}
+	err := tx.Model(cur).
+		Context(ctx).
+		Where("resource_id = ?", r.ID).
+		Where("status = ?", r.Status).
+		Where("updated_at = ?", r.UpdatedAt).
+		Select()
+	if err != nil {
+		if errors.Is(err, pg.ErrNoRows) {
+			return nil
 		}
-		cur.ID = r.ID
-		cur.Status = processingStatus
-		if _, err = tx.Model(cur).Context(ctx).Column("status").WherePK().Update(); err != nil {
-			return err
-		}
-		select {
-		case s.jobs <- job{status: processingStatus, id: r.ID}:
-		case <-s.ctx.Done():
-		}
-		return nil
-	})
+		return err
+	}
+	cur.ID = r.ID
+	cur.Status = processingStatus
+	if _, err = tx.Model(cur).Context(ctx).Column("status").WherePK().Update(); err != nil {
+		return err
+	}
+	select {
+	case s.jobs <- job{status: processingStatus, id: r.ID}:
+	case <-s.ctx.Done():
+	}
+	return nil
 }
 
 func (s *Worker) Close() {
