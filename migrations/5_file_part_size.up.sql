@@ -1,0 +1,1 @@
+ALTER TABLE file ADD COLUMN part_size bigint NOT NULL DEFAULT 0;

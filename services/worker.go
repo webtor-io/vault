@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	pg "github.com/go-pg/pg/v10"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -525,7 +525,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
 		return nil, err
 	}
-	if err == nil && (f.Status == StatusStored || f.UpdatedAt.Add(10*time.Second).After(time.Now())) {
+	if err == nil && (f.Status == StatusStored || (f.UpdatedAt.Add(10*time.Second).After(time.Now()) && f.UploadID == "")) {
 		return f, nil
 	}
 	_, err = db.Model(f).Context(ctx).Insert()
@@ -533,10 +533,91 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, err
 	}
 
-	// Progress reporting wrapper with throttled DB flushes (once every 5 seconds)
-	var stored int64
+	s3Cl := s.s3.Get()
+
+	partSize := s.part
+	if partSize < 5*1024*1024 {
+		partSize = 5 * 1024 * 1024
+	}
+
+	if f.UploadID != "" && f.PartSize != partSize {
+		log.WithFields(log.Fields{
+			"hash":          hash,
+			"old_part_size": f.PartSize,
+			"new_part_size": partSize,
+		}).Info("part size changed, restarting upload")
+		_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(hash),
+			UploadId: aws.String(f.UploadID),
+		})
+		f.UploadID = ""
+		f.StoredSize = 0
+		f.PartSize = partSize
+		if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
+			return nil, err
+		}
+	}
+
+	if f.UploadID == "" {
+		out, err := s3Cl.CreateMultipartUploadWithContext(ctx, &awss3.CreateMultipartUploadInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(hash),
+		})
+		if err != nil {
+			return nil, err
+		}
+		f.UploadID = *out.UploadId
+		f.StoredSize = 0
+		f.PartSize = partSize
+		if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
+			return nil, err
+		}
+	}
+
+	var completedParts []*awss3.CompletedPart
+	var partNumber int64 = 1
+
+	err = s3Cl.ListPartsPagesWithContext(ctx, &awss3.ListPartsInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(hash),
+		UploadId: aws.String(f.UploadID),
+	}, func(out *awss3.ListPartsOutput, lastPage bool) bool {
+		for _, p := range out.Parts {
+			completedParts = append(completedParts, &awss3.CompletedPart{
+				ETag:       p.ETag,
+				PartNumber: p.PartNumber,
+			})
+			if *p.PartNumber >= partNumber {
+				partNumber = *p.PartNumber + 1
+			}
+		}
+		return !lastPage
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NoSuchUpload" {
+			// Upload expired or deleted, restart
+			out, err := s3Cl.CreateMultipartUploadWithContext(ctx, &awss3.CreateMultipartUploadInput{
+				Bucket: aws.String(s.bucket),
+				Key:    aws.String(hash),
+			})
+			if err != nil {
+				return nil, err
+			}
+			f.UploadID = *out.UploadId
+			f.StoredSize = 0
+			f.PartSize = partSize
+			if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
+				return nil, err
+			}
+			partNumber = 1
+			completedParts = nil
+		} else {
+			return nil, err
+		}
+	}
+
 	flush := func(stored int64) error {
-		// Update file and resource stored_size counters atomically
 		if _, err := db.Model(&File{Hash: hash}).
 			Context(ctx).
 			Set("stored_size = ?", stored).
@@ -556,55 +637,70 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil
 	}
 
-	flushCtx, cancel := context.WithCancel(ctx)
-	flushTicker := time.NewTicker(5 * time.Second)
-	defer flushTicker.Stop()
-	defer cancel()
-	go func() {
-		for {
-			select {
-			case <-flushCtx.Done():
-				return
-			case <-flushTicker.C:
-				if err := flush(stored); err != nil {
-					log.WithError(err).Error("flush progress failed")
-				}
-			}
-		}
-	}()
-	s3Cl := s.s3.Get()
-	r, err := s.api.Download(ctx, u)
-	if err != nil {
-		return nil, err
+	stored := int64(len(completedParts)) * partSize
+	if stored > f.TotalSize {
+		stored = f.TotalSize
 	}
-	defer func(r io.ReadCloser) {
-		_ = r.Close()
-	}(r)
 
-	pr := &progressReader{
-		r: r,
-		onRead: func(n int) error {
-			stored += int64(n)
-			return nil
-		},
+	for stored < f.TotalSize {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		end := stored + partSize
+		if end > f.TotalSize {
+			end = f.TotalSize
+		}
+
+		r, err := s.api.DownloadWithRange(ctx, u, int(stored), int(end-1))
+		if err != nil {
+			return nil, err
+		}
+
+		upOut, err := s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
+			Bucket:     aws.String(s.bucket),
+			Key:        aws.String(hash),
+			UploadId:   aws.String(f.UploadID),
+			PartNumber: aws.Int64(partNumber),
+			Body:       aws.ReadSeekCloser(r),
+		})
+		_ = r.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		completedParts = append(completedParts, &awss3.CompletedPart{
+			ETag:       upOut.ETag,
+			PartNumber: aws.Int64(partNumber),
+		})
+
+		stored = end
+		partNumber++
+
+		if err := flush(stored); err != nil {
+			log.WithError(err).Error("flush progress failed")
+		}
 	}
-	// Upload stream directly to S3 under the file hash key using s3manager (supports io.Reader)
-	uploader := s3manager.NewUploaderWithClient(s3Cl, func(u *s3manager.Uploader) {
-		u.Concurrency = s.concur
-		u.PartSize = s.part
-	})
-	_, err = uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(hash),
-		Body:   pr,
+
+	_, err = s3Cl.CompleteMultipartUploadWithContext(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(hash),
+		UploadId: aws.String(f.UploadID),
+		MultipartUpload: &awss3.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
+
 	// Ensure file status and stored_size are finalized
 	f.Status = StatusStored
 	f.StoredSize = f.TotalSize
-	if _, err := db.Model(f).Context(ctx).Column("status", "stored_size").WherePK().Update(); err != nil {
+	f.UploadID = ""
+	if _, err := db.Model(f).Context(ctx).Column("status", "stored_size", "upload_id").WherePK().Update(); err != nil {
 		return nil, err
 	}
 	log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": item.Size}).Info("stored to s3")

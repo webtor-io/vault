@@ -21,3 +21,4 @@ vault
 dist/
 bin/
 coverage/
+chart
