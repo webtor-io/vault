@@ -654,7 +654,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			end = f.TotalSize
 		}
 
-		r, err := s.api.DownloadWithRange(ctx, u, int(stored), int(end-1))
+		r, err := s.api.DownloadWithRange(ctx, u, int(stored), -1)
 		if err != nil {
 			return nil, err
 		}
