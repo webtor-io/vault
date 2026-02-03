@@ -642,6 +642,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		stored = f.TotalSize
 	}
 
+	if err := flush(stored); err != nil {
+		log.WithError(err).Error("initial flush progress failed")
+	}
+
 	for stored < f.TotalSize {
 		select {
 		case <-ctx.Done():
