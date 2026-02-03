@@ -13,8 +13,8 @@ $$ LANGUAGE plpgsql;
 CREATE TABLE IF NOT EXISTS resource (
   resource_id TEXT PRIMARY KEY,
   status      SMALLINT NOT NULL,
-  total_size  BIGINT NOT NULL DEFAULT 0 CHECK (total_size >= 0),
-  stored_size BIGINT NOT NULL DEFAULT 0 CHECK (stored_size >= 0 AND stored_size <= total_size),
+  total_size  BIGINT NOT NULL DEFAULT 0,
+  stored_size BIGINT NOT NULL DEFAULT 0,
   error       TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -26,8 +26,8 @@ CREATE INDEX IF NOT EXISTS idx_resource_status ON resource(status);
 CREATE TABLE IF NOT EXISTS file (
   hash        text PRIMARY KEY,
   status      SMALLINT NOT NULL,
-  total_size  BIGINT NOT NULL DEFAULT 0 CHECK (total_size >= 0),
-  stored_size BIGINT NOT NULL DEFAULT 0 CHECK (stored_size >= 0 AND stored_size <= total_size),
+  total_size  BIGINT NOT NULL DEFAULT 0,
+  stored_size BIGINT NOT NULL DEFAULT 0,
   path        TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()

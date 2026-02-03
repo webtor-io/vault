@@ -305,13 +305,13 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		return err
 	}
 
+	var totalSize, totalStored int64
 	// Paginate through results to find the file at the specified index
 	for {
 		resp, err := s.api.ListResourceContent(ctx, cla, id, listArgs)
 		if err != nil {
 			return err
 		}
-		var totalSize, totalStored int64
 		for _, item := range resp.Items {
 			if item.Type == ra.ListTypeFile {
 				// First, increment total size for the resource
