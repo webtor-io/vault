@@ -617,9 +617,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 	}
 
-	lastFlush := time.Now()
 	flush := func(stored int64) error {
-		lastFlush = time.Now()
 		if _, err := db.Model(&File{Hash: hash}).
 			Context(ctx).
 			Set("stored_size = ?", stored).
@@ -678,15 +676,25 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}).Info("uploading part")
 
 		var partStored int64
-		pr := &progressReader{
-			r: r,
-			onRead: func(n int) error {
-				partStored += int64(n)
-				if time.Since(lastFlush) >= 10*time.Second {
+		partCtx, partCancel := context.WithCancel(ctx)
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-partCtx.Done():
+					return
+				case <-ticker.C:
 					if err := flush(stored + partStored); err != nil {
 						log.WithError(err).Error("periodic flush progress failed")
 					}
 				}
+			}
+		}()
+		pr := &progressReader{
+			r: r,
+			onRead: func(n int) error {
+				partStored += int64(n)
 				return nil
 			},
 		}
@@ -698,6 +706,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			PartNumber: aws.Int64(partNumber),
 			Body:       aws.ReadSeekCloser(pr),
 		})
+		partCancel()
 		_ = r.Close()
 		if err != nil {
 			return nil, err
