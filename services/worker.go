@@ -654,10 +654,22 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			end = f.TotalSize
 		}
 
-		r, err := s.api.DownloadWithRange(ctx, u, int(stored), -1)
+		r, err := s.api.DownloadWithRange(ctx, u, int(stored), int(end-1))
 		if err != nil {
 			return nil, err
 		}
+
+		log.WithFields(log.Fields{
+			"bucket":      s.bucket,
+			"resource_id": id,
+			"path":        item.PathStr,
+			"key":         hash,
+			"size":        item.Size,
+			"upload_id":   f.UploadID,
+			"part_number": partNumber,
+			"part_size":   partSize,
+			"start_byte":  stored,
+		}).Info("uploading part")
 
 		upOut, err := s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
 			Bucket:     aws.String(s.bucket),
