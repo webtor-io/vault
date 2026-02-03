@@ -77,7 +77,7 @@ func RegisterWorkerFlags(f []cli.Flag) []cli.Flag {
 		cli.IntFlag{
 			Name:   awsUploadConcurrencyFlag,
 			Usage:  "aws upload concurrency",
-			Value:  10,
+			Value:  1,
 			EnvVar: "AWS_UPLOAD_CONCURRENCY",
 		},
 		cli.Int64Flag{
