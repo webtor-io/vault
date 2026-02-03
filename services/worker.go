@@ -38,6 +38,25 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+type chunkReader struct {
+	r    io.Reader
+	size int64
+	read int64
+}
+
+func (c *chunkReader) Read(b []byte) (int, error) {
+	if c.read >= c.size {
+		return 0, io.EOF
+	}
+	toRead := c.size - c.read
+	if int64(len(b)) > toRead {
+		b = b[:toRead]
+	}
+	n, err := c.r.Read(b)
+	c.read += int64(n)
+	return n, err
+}
+
 // Worker is a placeholder for background tasks (store/delete torrent data, update progress).
 type Worker struct {
 	ctx    context.Context
@@ -646,6 +665,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		log.WithError(err).Error("initial flush progress failed")
 	}
 
+	r, err := s.api.DownloadWithRange(ctx, u, int(stored), -1)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
 	for stored < f.TotalSize {
 		select {
 		case <-ctx.Done():
@@ -653,14 +678,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		default:
 		}
 
-		end := stored + partSize
-		if end > f.TotalSize {
-			end = f.TotalSize
-		}
-
-		r, err := s.api.DownloadWithRange(ctx, u, int(stored), int(end-1))
-		if err != nil {
-			return nil, err
+		currentPartSize := partSize
+		if stored+currentPartSize > f.TotalSize {
+			currentPartSize = f.TotalSize - stored
 		}
 
 		log.WithFields(log.Fields{
@@ -671,7 +691,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			"size":        item.Size,
 			"upload_id":   f.UploadID,
 			"part_number": partNumber,
-			"part_size":   partSize,
+			"part_size":   currentPartSize,
 			"start_byte":  stored,
 		}).Info("uploading part")
 
@@ -691,8 +711,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				}
 			}
 		}()
+		cr := &chunkReader{
+			r:    r,
+			size: currentPartSize,
+		}
 		pr := &progressReader{
-			r: r,
+			r: cr,
 			onRead: func(n int) error {
 				partStored += int64(n)
 				return nil
@@ -707,7 +731,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			Body:       aws.ReadSeekCloser(pr),
 		})
 		partCancel()
-		_ = r.Close()
 		if err != nil {
 			return nil, err
 		}
@@ -717,7 +740,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			PartNumber: aws.Int64(partNumber),
 		})
 
-		stored = end
+		stored += currentPartSize
 		partNumber++
 
 		if err := flush(stored); err != nil {
