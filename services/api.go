@@ -138,6 +138,7 @@ func (s *ListResourceContentArgs) ToQuery() url.Values {
 	q.Set("offset", strconv.Itoa(int(offset)))
 	q.Set("path", path)
 	q.Set("output", string(output))
+	q.Set("use-premium-domain", "false")
 	return q
 }
 
@@ -285,6 +286,11 @@ func (s *Api) DownloadWithRange(ctx context.Context, u string, start int, end in
 		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", startStr, endStr))
 	}
+	log.WithFields(log.Fields{
+		"url":   req.URL.String(),
+		"start": start,
+		"end":   end,
+	}).Info("downloading with range")
 	res, err := s.cl.Do(req)
 	if err != nil {
 		log.WithError(err).Error("failed to do request")
