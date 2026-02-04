@@ -1,13 +1,16 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -19,43 +22,6 @@ import (
 	cs "github.com/webtor-io/common-services"
 	ra "github.com/webtor-io/rest-api/services"
 )
-
-// progressReader wraps an io.Reader and invokes onRead with the number of bytes
-// read on each successful Read call. If onRead returns an error, reading stops
-// and that error is propagated to the caller.
-type progressReader struct {
-	r      io.Reader
-	onRead func(n int) error
-}
-
-func (p *progressReader) Read(b []byte) (int, error) {
-	n, err := p.r.Read(b)
-	if n > 0 && p.onRead != nil {
-		if cbErr := p.onRead(n); cbErr != nil {
-			return n, cbErr
-		}
-	}
-	return n, err
-}
-
-type chunkReader struct {
-	r    io.Reader
-	size int64
-	read int64
-}
-
-func (c *chunkReader) Read(b []byte) (int, error) {
-	if c.read >= c.size {
-		return 0, io.EOF
-	}
-	toRead := c.size - c.read
-	if int64(len(b)) > toRead {
-		b = b[:toRead]
-	}
-	n, err := c.r.Read(b)
-	c.read += int64(n)
-	return n, err
-}
 
 // Worker is a placeholder for background tasks (store/delete torrent data, update progress).
 type Worker struct {
@@ -679,11 +645,76 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 	defer r.Close()
 
+	type partJob struct {
+		partNumber int64
+		data       []byte
+	}
+	type partResult struct {
+		completedPart *awss3.CompletedPart
+		err           error
+	}
+
+	jobs := make(chan partJob, s.concur)
+	results := make(chan partResult, s.concur)
+	var wg sync.WaitGroup
+
+	for i := 0; i < s.concur; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pj := range jobs {
+				upOut, err := s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
+					Bucket:     aws.String(s.bucket),
+					Key:        aws.String(hash),
+					UploadId:   aws.String(f.UploadID),
+					PartNumber: aws.Int64(pj.partNumber),
+					Body:       bytes.NewReader(pj.data),
+				})
+				results <- partResult{
+					completedPart: &awss3.CompletedPart{
+						ETag:       upOut.ETag,
+						PartNumber: aws.Int64(pj.partNumber),
+					},
+					err: err,
+				}
+			}
+		}()
+	}
+
+	var uploadErr error
+	var uploadErrOnce sync.Once
+	setUploadErr := func(err error) {
+		uploadErrOnce.Do(func() {
+			uploadErr = err
+		})
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var mu sync.Mutex
+	go func() {
+		for res := range results {
+			if res.err != nil {
+				setUploadErr(res.err)
+				continue
+			}
+			mu.Lock()
+			completedParts = append(completedParts, res.completedPart)
+			mu.Unlock()
+		}
+	}()
+
 	for stored < f.TotalSize {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
+		}
+		if uploadErr != nil {
+			break
 		}
 
 		currentPartSize := partSize
@@ -701,52 +732,19 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			"part_number": partNumber,
 			"part_size":   currentPartSize,
 			"start_byte":  stored,
-		}).Info("uploading part")
+		}).Info("reading part")
 
-		var partStored int64
-		partCtx, partCancel := context.WithCancel(ctx)
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-partCtx.Done():
-					return
-				case <-ticker.C:
-					if err := flush(stored + partStored); err != nil {
-						log.WithError(err).Error("periodic flush progress failed")
-					}
-				}
-			}
-		}()
-		cr := &chunkReader{
-			r:    r,
-			size: currentPartSize,
-		}
-		pr := &progressReader{
-			r: cr,
-			onRead: func(n int) error {
-				partStored += int64(n)
-				return nil
-			},
-		}
-
-		upOut, err := s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
-			Bucket:     aws.String(s.bucket),
-			Key:        aws.String(hash),
-			UploadId:   aws.String(f.UploadID),
-			PartNumber: aws.Int64(partNumber),
-			Body:       aws.ReadSeekCloser(pr),
-		})
-		partCancel()
+		buf := make([]byte, currentPartSize)
+		_, err := io.ReadFull(r, buf)
 		if err != nil {
-			return nil, err
+			setUploadErr(err)
+			break
 		}
 
-		completedParts = append(completedParts, &awss3.CompletedPart{
-			ETag:       upOut.ETag,
-			PartNumber: aws.Int64(partNumber),
-		})
+		jobs <- partJob{
+			partNumber: partNumber,
+			data:       buf,
+		}
 
 		stored += currentPartSize
 		partNumber++
@@ -755,6 +753,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			log.WithError(err).Error("flush progress failed")
 		}
 	}
+	close(jobs)
+	wg.Wait()
+
+	if uploadErr != nil {
+		return nil, uploadErr
+	}
+
+	sort.Slice(completedParts, func(i, j int) bool {
+		return *completedParts[i].PartNumber < *completedParts[j].PartNumber
+	})
 
 	_, err = s3Cl.CompleteMultipartUploadWithContext(ctx, &awss3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(s.bucket),
