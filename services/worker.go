@@ -635,6 +635,30 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		stored = f.TotalSize
 	}
 
+	flushCtx, flushCancel := context.WithCancel(ctx)
+	var mu sync.Mutex
+	defer flushCancel()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-flushCtx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				currentStored := int64(len(completedParts)) * partSize
+				mu.Unlock()
+				if currentStored > f.TotalSize {
+					currentStored = f.TotalSize
+				}
+				if err := flush(currentStored); err != nil {
+					log.WithError(err).Error("periodic flush progress failed")
+				}
+			}
+		}
+	}()
+
 	if err := flush(stored); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
 	}
@@ -694,7 +718,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		close(results)
 	}()
 
-	var mu sync.Mutex
 	go func() {
 		for res := range results {
 			if res.err != nil {
@@ -704,29 +727,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			mu.Lock()
 			completedParts = append(completedParts, res.completedPart)
 			mu.Unlock()
-		}
-	}()
-
-	flushCtx, flushCancel := context.WithCancel(ctx)
-	defer flushCancel()
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-flushCtx.Done():
-				return
-			case <-ticker.C:
-				mu.Lock()
-				currentStored := int64(len(completedParts)) * partSize
-				mu.Unlock()
-				if currentStored > f.TotalSize {
-					currentStored = f.TotalSize
-				}
-				if err := flush(currentStored); err != nil {
-					log.WithError(err).Error("periodic flush progress failed")
-				}
-			}
 		}
 	}()
 
