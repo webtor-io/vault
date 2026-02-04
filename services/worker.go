@@ -667,7 +667,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err != nil {
 		return nil, err
 	}
-	defer r.Close()
+	defer func(r io.ReadCloser) {
+		_ = r.Close()
+	}(r)
 
 	type partJob struct {
 		partNumber int64
@@ -687,13 +689,29 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		go func() {
 			defer wg.Done()
 			for pj := range jobs {
-				upOut, err := s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
-					Bucket:     aws.String(s.bucket),
-					Key:        aws.String(hash),
-					UploadId:   aws.String(f.UploadID),
-					PartNumber: aws.Int64(pj.partNumber),
-					Body:       bytes.NewReader(pj.data),
-				})
+				var upOut *awss3.UploadPartOutput
+				var err error
+				for i := 0; i < 3; i++ {
+					upOut, err = s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
+						Bucket:     aws.String(s.bucket),
+						Key:        aws.String(hash),
+						UploadId:   aws.String(f.UploadID),
+						PartNumber: aws.Int64(pj.partNumber),
+						Body:       bytes.NewReader(pj.data),
+					})
+					if err == nil {
+						break
+					}
+					log.WithFields(log.Fields{
+						"bucket":      s.bucket,
+						"resource_id": id,
+						"key":         hash,
+						"upload_id":   f.UploadID,
+						"part_number": pj.partNumber,
+						"attempt":     i + 1,
+					}).WithError(err).Warn("failed to upload part, retrying")
+					time.Sleep(time.Second * time.Duration(i+1))
+				}
 				results <- partResult{
 					completedPart: &awss3.CompletedPart{
 						ETag:       upOut.ETag,
@@ -771,10 +789,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 
 		stored += currentPartSize
 		partNumber++
-
-		if err := flush(stored); err != nil {
-			log.WithError(err).Error("flush progress failed")
-		}
 	}
 	close(jobs)
 	wg.Wait()
