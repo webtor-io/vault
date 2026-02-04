@@ -138,7 +138,6 @@ func (s *ListResourceContentArgs) ToQuery() url.Values {
 	q.Set("offset", strconv.Itoa(int(offset)))
 	q.Set("path", path)
 	q.Set("output", string(output))
-	q.Set("use-premium-domain", "false")
 	return q
 }
 
@@ -245,7 +244,7 @@ func (s *Api) doRequest(ctx context.Context, c *Claims, url string, method strin
 }
 
 func (s *Api) ExportResourceContent(ctx context.Context, c *Claims, infohash string, itemID string) (e *ra.ExportResponse, err error) {
-	u := s.url + "/resource/" + infohash + "/export/" + itemID
+	u := s.url + "/resource/" + infohash + "/export/" + itemID + "?use-premium-domain=false"
 	e = &ra.ExportResponse{}
 	err = s.doRequest(ctx, c, u, "GET", nil, e)
 	// if e.Source.ID == nil
