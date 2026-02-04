@@ -134,7 +134,15 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		err := tx.Model(&list).
 			Context(ctx).
 			Where("status != ?", StatusStored).
-			Where("now() - updated_at > interval '1 minute'").
+			WhereGroup(func(q *pg.Query) (*pg.Query, error) {
+				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
+					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
+						Where("now() - updated_at > interval '30 minutes'"), nil
+				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
+					return q.Where("status NOT IN (?, ?)", StatusStoreError, StatusDeleteError).
+						Where("now() - updated_at > interval '1 minute'"), nil
+				}), nil
+			}).
 			For("UPDATE SKIP LOCKED").
 			Select()
 		if err != nil && !errors.Is(err, pg.ErrNoRows) {
@@ -696,6 +704,29 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			mu.Lock()
 			completedParts = append(completedParts, res.completedPart)
 			mu.Unlock()
+		}
+	}()
+
+	flushCtx, flushCancel := context.WithCancel(ctx)
+	defer flushCancel()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-flushCtx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				currentStored := int64(len(completedParts)) * partSize
+				mu.Unlock()
+				if currentStored > f.TotalSize {
+					currentStored = f.TotalSize
+				}
+				if err := flush(currentStored); err != nil {
+					log.WithError(err).Error("periodic flush progress failed")
+				}
+			}
 		}
 	}()
 
