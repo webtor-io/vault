@@ -473,6 +473,7 @@ func (s *Worker) handleError(ctx context.Context, id string, err error, status S
 }
 
 func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64) (*File, error) {
+
 	if s.bucket == "" {
 		return nil, errors.New("s3 bucket is not configured")
 	}
@@ -502,8 +503,63 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, err
 	}
 	u := ei.ExportItems["download"].URL
+
+	hash := ""
+	flush := func(stored int64) error {
+		if hash != "" {
+			if _, err := db.Model(&File{Hash: hash}).
+				Context(ctx).
+				Set("stored_size = ?", stored).
+				Set("updated_at = now()").
+				WherePK().
+				Update(); err != nil {
+				return err
+			}
+		}
+		if _, err := db.Model(&Resource{ID: id}).
+			Context(ctx).
+			Set("stored_size = ?", totalStored+stored).
+			Set("updated_at = now()").
+			Where("resource_id = ?", id).
+			Update(); err != nil {
+			return err
+		}
+		return nil
+	}
+	flushCtx, flushCancel := context.WithCancel(ctx)
+	var mu sync.Mutex
+	var completedParts []*awss3.CompletedPart
+	partSize := s.part
+	if partSize < 5*1024*1024 {
+		partSize = 5 * 1024 * 1024
+	}
+
+	defer flushCancel()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-flushCtx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				currentStored := int64(len(completedParts)) * partSize
+				mu.Unlock()
+				if currentStored > item.Size {
+					currentStored = item.Size
+				}
+				if err := flush(currentStored); err != nil {
+					log.WithError(err).Error("periodic flush progress failed")
+				}
+			}
+		}
+	}()
+	if err := flush(0); err != nil {
+		log.WithError(err).Error("initial flush progress failed")
+	}
 	log.WithField("url", u).Debug("export url")
-	hash, err := s.generateFileHash(ctx, item, ei)
+	hash, err = s.generateFileHash(ctx, item, ei)
 	if err != nil {
 		return nil, err
 	}
@@ -530,11 +586,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 
 	s3Cl := s.s3.Get()
-
-	partSize := s.part
-	if partSize < 5*1024*1024 {
-		partSize = 5 * 1024 * 1024
-	}
 
 	if f.UploadID != "" && f.PartSize != partSize {
 		log.WithFields(log.Fields{
@@ -571,7 +622,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 	}
 
-	var completedParts []*awss3.CompletedPart
 	var partNumber int64 = 1
 
 	err = s3Cl.ListPartsPagesWithContext(ctx, &awss3.ListPartsInput{
@@ -613,54 +663,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 	}
 
-	flush := func(stored int64) error {
-		if _, err := db.Model(&File{Hash: hash}).
-			Context(ctx).
-			Set("stored_size = ?", stored).
-			Set("updated_at = now()").
-			WherePK().
-			Update(); err != nil {
-			return err
-		}
-		if _, err := db.Model(&Resource{ID: id}).
-			Context(ctx).
-			Set("stored_size = ?", totalStored+stored).
-			Set("updated_at = now()").
-			Where("resource_id = ?", id).
-			Update(); err != nil {
-			return err
-		}
-		return nil
-	}
-
 	stored := int64(len(completedParts)) * partSize
 	if stored > f.TotalSize {
 		stored = f.TotalSize
 	}
-
-	flushCtx, flushCancel := context.WithCancel(ctx)
-	var mu sync.Mutex
-	defer flushCancel()
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-flushCtx.Done():
-				return
-			case <-ticker.C:
-				mu.Lock()
-				currentStored := int64(len(completedParts)) * partSize
-				mu.Unlock()
-				if currentStored > f.TotalSize {
-					currentStored = f.TotalSize
-				}
-				if err := flush(currentStored); err != nil {
-					log.WithError(err).Error("periodic flush progress failed")
-				}
-			}
-		}
-	}()
 
 	if err := flush(stored); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
