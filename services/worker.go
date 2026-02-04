@@ -163,6 +163,7 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 }
 
 func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) error {
+	log.WithField("id", r.ID).WithField("status", r.Status).Info("processing resource")
 	var processingStatus Status
 	switch r.Status {
 	case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
@@ -189,7 +190,9 @@ func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) err
 	}
 	cur.ID = r.ID
 	cur.Status = processingStatus
-	if _, err = tx.Model(cur).Context(ctx).Column("status").WherePK().Update(); err != nil {
+	cur.UpdatedAt = time.Now()
+
+	if _, err = tx.Model(cur).Context(ctx).Column("status", "updated_at").WherePK().Update(); err != nil {
 		return err
 	}
 	select {
