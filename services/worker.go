@@ -134,15 +134,7 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		err := tx.Model(&list).
 			Context(ctx).
 			Where("status != ?", StatusStored).
-			WhereGroup(func(q *pg.Query) (*pg.Query, error) {
-				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
-						Where("now() - updated_at > interval '30 minutes'"), nil
-				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status NOT IN (?, ?)", StatusStoreError, StatusDeleteError).
-						Where("now() - updated_at > interval '1 minute'"), nil
-				}), nil
-			}).
+			Where("now() - updated_at > interval '1 minute'").
 			For("UPDATE SKIP LOCKED").
 			Select()
 		if err != nil && !errors.Is(err, pg.ErrNoRows) {
