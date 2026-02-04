@@ -528,7 +528,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 	flushCtx, flushCancel := context.WithCancel(ctx)
 	var mu sync.Mutex
+	mu.Lock()
 	var completedParts []*awss3.CompletedPart
+	completedPartsMap := make(map[int64]*awss3.CompletedPart)
+	mu.Unlock()
 	partSize := s.part
 	if partSize < 5*1024*1024 {
 		partSize = 5 * 1024 * 1024
@@ -544,7 +547,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				return
 			case <-ticker.C:
 				mu.Lock()
-				currentStored := int64(len(completedParts)) * partSize
+				currentStored := int64(len(completedPartsMap)) * partSize
 				mu.Unlock()
 				if currentStored > item.Size {
 					currentStored = item.Size
@@ -629,11 +632,13 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		Key:      aws.String(hash),
 		UploadId: aws.String(f.UploadID),
 	}, func(out *awss3.ListPartsOutput, lastPage bool) bool {
+		mu.Lock()
+		defer mu.Unlock()
 		for _, p := range out.Parts {
-			completedParts = append(completedParts, &awss3.CompletedPart{
+			completedPartsMap[*p.PartNumber] = &awss3.CompletedPart{
 				ETag:       p.ETag,
 				PartNumber: p.PartNumber,
-			})
+			}
 			if *p.PartNumber >= partNumber {
 				partNumber = *p.PartNumber + 1
 			}
@@ -663,7 +668,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 	}
 
-	stored := int64(len(completedParts)) * partSize
+	mu.Lock()
+	stored := int64(len(completedPartsMap)) * partSize
+	mu.Unlock()
 	if stored > f.TotalSize {
 		stored = f.TotalSize
 	}
@@ -672,7 +679,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		log.WithError(err).Error("initial flush progress failed")
 	}
 
-	r, err := s.api.DownloadWithRange(ctx, u, int(stored), -1)
+	dctx, dcancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer dcancel()
+	r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
 	if err != nil {
 		return nil, err
 	}
@@ -752,7 +761,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				continue
 			}
 			mu.Lock()
-			completedParts = append(completedParts, res.completedPart)
+			completedPartsMap[*res.completedPart.PartNumber] = res.completedPart
 			mu.Unlock()
 		}
 	}()
@@ -806,6 +815,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, uploadErr
 	}
 
+	mu.Lock()
+	for _, p := range completedPartsMap {
+		completedParts = append(completedParts, p)
+	}
+	mu.Unlock()
+
 	sort.Slice(completedParts, func(i, j int) bool {
 		return *completedParts[i].PartNumber < *completedParts[j].PartNumber
 	})
@@ -834,6 +849,8 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 }
 
 func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.ExportResponse) (string, error) {
+	dctx, dcancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer dcancel()
 	u := ei.ExportItems["download"].URL
 	size := item.Size
 	var limitStart int64 = 500 * 1024
@@ -841,7 +858,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 	h := sha256.New()
 	h.Write([]byte(fmt.Sprintf("%v", size)))
 	if size < limitStart+limitEnd {
-		r, err := s.api.Download(ctx, u)
+		r, err := s.api.Download(dctx, u)
 		if err != nil {
 			return "", err
 		}
@@ -853,7 +870,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 			return "", err
 		}
 	} else {
-		r, err := s.api.DownloadWithRange(ctx, u, 0, int(limitStart))
+		r, err := s.api.DownloadWithRange(dctx, u, 0, int(limitStart))
 		if err != nil {
 			return "", err
 		}
@@ -864,7 +881,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 		if err != nil {
 			return "", err
 		}
-		r, err = s.api.DownloadWithRange(ctx, u, int(size-limitEnd), -1)
+		r, err = s.api.DownloadWithRange(dctx, u, int(size-limitEnd), -1)
 		if err != nil {
 			return "", err
 		}
