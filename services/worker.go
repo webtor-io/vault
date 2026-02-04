@@ -741,7 +741,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 
 		currentPartSize := partSize
-		if stored+currentPartSize > f.TotalSize {
+		if stored+2*currentPartSize > f.TotalSize {
 			currentPartSize = f.TotalSize - stored
 		}
 
