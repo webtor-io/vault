@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -17,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	pg "github.com/go-pg/pg/v10"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
@@ -146,7 +146,7 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 			For("UPDATE SKIP LOCKED").
 			Select()
 		if err != nil && !errors.Is(err, pg.ErrNoRows) {
-			return err
+			return errors.Wrap(err, "failed to select resources for processing")
 		}
 		for _, r := range list {
 			if err := s.processResource(ctx, tx, r); err != nil {
@@ -157,7 +157,7 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to run transaction in process")
 	}
 	return nil
 }
@@ -186,14 +186,14 @@ func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) err
 		if errors.Is(err, pg.ErrNoRows) {
 			return nil
 		}
-		return err
+		return errors.Wrap(err, "failed to select resource for update")
 	}
 	cur.ID = r.ID
 	cur.Status = processingStatus
 	cur.UpdatedAt = time.Now()
 
 	if _, err = tx.Model(cur).Context(ctx).Column("status", "updated_at").WherePK().Update(); err != nil {
-		return err
+		return errors.Wrap(err, "failed to update resource status to processing")
 	}
 	select {
 	case s.jobs <- job{status: processingStatus, id: r.ID}:
@@ -316,7 +316,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		Set("error = null").
 		Where("resource_id = ?", id).
 		Update(); err != nil {
-		return err
+		return errors.Wrap(err, "failed to reset resource counters")
 	}
 
 	var totalSize, totalStored int64
@@ -324,7 +324,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	for {
 		resp, err := s.api.ListResourceContent(ctx, cla, id, listArgs)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to list resource content")
 		}
 		for _, item := range resp.Items {
 			if item.Type == ra.ListTypeFile {
@@ -335,12 +335,12 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 					Set("total_size = ?", totalSize).
 					Where("resource_id = ?", id).
 					Update(); err != nil {
-					return err
+					return errors.Wrap(err, "failed to update resource total_size")
 				}
 
 				f, err := s.storeFile(ctx, cla, id, item, totalStored)
 				if err != nil {
-					return err
+					return errors.Wrap(err, "failed to store file")
 				}
 				totalStored += item.Size
 
@@ -350,7 +350,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 					Set("error = ?", "").
 					Where("resource_id = ?", id).
 					Update(); err != nil {
-					return err
+					return errors.Wrap(err, "failed to update resource stored_size")
 				}
 				rf := &ResourceFile{
 					ResourceID: id,
@@ -359,7 +359,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 				}
 				_, err = db.Model(rf).Insert()
 				if err != nil && !strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-					return err
+					return errors.Wrap(err, "failed to insert resource_file")
 				} else if err != nil {
 					continue
 				}
@@ -380,7 +380,10 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		Column("status").
 		Where("resource_id = ?", id).
 		Update()
-	return err
+	if err != nil {
+		return errors.Wrap(err, "failed to update resource status to stored")
+	}
+	return nil
 }
 
 func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err error) {
@@ -390,7 +393,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	// 1) Collect all files linked to this resource
 	var rfs []ResourceFile
 	if err := db.Model(&rfs).Context(ctx).Where("resource_id = ?", id).Select(); err != nil && !errors.Is(err, pg.ErrNoRows) {
-		return err
+		return errors.Wrap(err, "failed to select resource files for deletion")
 	}
 
 	// 2) For each file check if it's referenced by any other resource, if not — delete from S3 and DB
@@ -399,7 +402,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 		f := &File{Hash: rf.FileHash}
 		if err := db.Model(f).Context(ctx).WherePK().Select(); err != nil {
 			if !errors.Is(err, pg.ErrNoRows) {
-				return err
+				return errors.Wrap(err, "failed to select file for deletion")
 			}
 		} else {
 			// Decrease resource stored_size by the size currently accounted for this file
@@ -409,7 +412,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 				Set("updated_at = now()").
 				Where("resource_id = ?", id).
 				Update(); err != nil {
-				return err
+				return errors.Wrap(err, "failed to update resource stored_size during deletion")
 			}
 		}
 		// Count references excluding current resource
@@ -418,7 +421,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 			Where("resource_id <> ?", id).
 			Count()
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to count file references")
 		}
 		if cnt > 0 {
 			continue
@@ -431,7 +434,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 			Set("updated_at = now()").
 			WherePK().
 			Update(); err != nil && !errors.Is(err, pg.ErrNoRows) {
-			return err
+			return errors.Wrap(err, "failed to mark file as deleting")
 		}
 		// No more references — delete S3 object (if configured) and file row
 		s3Cl := s.s3.Get()
@@ -440,20 +443,22 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 			Key:    aws.String(rf.FileHash),
 		})
 		if delErr != nil {
-			return delErr
+			return errors.Wrapf(delErr, "failed to delete object from S3, bucket=%s, key=%s", s.bucket, rf.FileHash)
 		}
 		log.WithFields(log.Fields{"bucket": s.bucket, "path": rf.Path, "resource_id": id, "key": rf.FileHash}).Info("deleted from s3")
 		// Delete file row
 		f = &File{Hash: rf.FileHash}
 		if _, err := db.Model(f).Context(ctx).WherePK().Delete(); err != nil && !errors.Is(err, pg.ErrNoRows) {
-			return err
+			return errors.Wrap(err, "failed to delete file row from database")
 		}
 	}
 
 	res := &Resource{ID: id}
 	_, err = db.Model(res).Context(ctx).WherePK().Delete()
-
-	return err
+	if err != nil {
+		return errors.Wrap(err, "failed to delete resource from database")
+	}
+	return nil
 }
 
 func (s *Worker) handleError(ctx context.Context, id string, err error, status Status) {
@@ -491,7 +496,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		Limit(1).
 		Select()
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to check for existing file")
 	}
 	if err == nil {
 		// Found a suitable file that's already stored
@@ -500,7 +505,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// No existing stored file found by path+size, proceed with exporting and storing by content hash
 	ei, err := s.api.ExportResourceContent(ctx, cla, id, item.ID)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to export resource content")
 	}
 	u := ei.ExportItems["download"].URL
 
@@ -513,7 +518,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				Set("updated_at = now()").
 				WherePK().
 				Update(); err != nil {
-				return err
+				return errors.Wrap(err, "failed to update file stored_size")
 			}
 		}
 		if _, err := db.Model(&Resource{ID: id}).
@@ -522,7 +527,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			Set("updated_at = now()").
 			Where("resource_id = ?", id).
 			Update(); err != nil {
-			return err
+			return errors.Wrap(err, "failed to update resource stored_size during flush")
 		}
 		return nil
 	}
@@ -564,7 +569,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	log.WithField("url", u).Debug("export url")
 	hash, err = s.generateFileHash(ctx, item, ei)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to generate file hash")
 	}
 	log.WithField("hash", hash).Debug("generated hash")
 	// Prepare file model
@@ -578,14 +583,14 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		WherePK().
 		Select()
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to select file by hash")
 	}
 	if err == nil && (f.Status == StatusStored || (f.UpdatedAt.Add(10*time.Second).After(time.Now()) && f.UploadID == "")) {
 		return f, nil
 	}
 	_, err = db.Model(f).Context(ctx).Insert()
 	if err != nil && !strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to insert file")
 	}
 
 	s3Cl := s.s3.Get()
@@ -605,7 +610,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		f.StoredSize = 0
 		f.PartSize = partSize
 		if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to reset upload after part size change")
 		}
 	}
 
@@ -615,13 +620,13 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			Key:    aws.String(hash),
 		})
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrapf(err, "failed to create S3 multipart upload, bucket=%s, key=%s", s.bucket, hash)
 		}
 		f.UploadID = *out.UploadId
 		f.StoredSize = 0
 		f.PartSize = partSize
 		if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to update file with new upload_id")
 		}
 	}
 
@@ -653,18 +658,18 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				Key:    aws.String(hash),
 			})
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "failed to recreate S3 multipart upload after NoSuchUpload, bucket=%s, key=%s", s.bucket, hash)
 			}
 			f.UploadID = *out.UploadId
 			f.StoredSize = 0
 			f.PartSize = partSize
 			if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
-				return nil, err
+				return nil, errors.Wrap(err, "failed to update file after recreating upload")
 			}
 			partNumber = 1
 			completedParts = nil
 		} else {
-			return nil, err
+			return nil, errors.Wrapf(err, "failed to list S3 multipart upload parts, bucket=%s, key=%s, upload_id=%s", s.bucket, hash, f.UploadID)
 		}
 	}
 
@@ -683,7 +688,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	defer dcancel()
 	r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to download file content with range, url=%s, start=%d", u, stored)
 	}
 	defer func(r io.ReadCloser) {
 		_ = r.Close()
@@ -796,7 +801,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		buf := make([]byte, currentPartSize)
 		_, err := io.ReadFull(r, buf)
 		if err != nil {
-			setUploadErr(err)
+			setUploadErr(errors.Wrap(err, "failed to read part data from download stream"))
 			break
 		}
 
@@ -834,7 +839,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to complete S3 multipart upload, bucket=%s, key=%s, upload_id=%s", s.bucket, hash, f.UploadID)
 	}
 
 	// Ensure file status and stored_size are finalized
@@ -842,7 +847,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	f.StoredSize = f.TotalSize
 	f.UploadID = ""
 	if _, err := db.Model(f).Context(ctx).Column("status", "stored_size", "upload_id").WherePK().Update(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to finalize file status after upload")
 	}
 	log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": item.Size}).Info("stored to s3")
 	return f, nil
@@ -860,35 +865,38 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 	if size < limitStart+limitEnd {
 		r, err := s.api.Download(dctx, u)
 		if err != nil {
-			return "", err
+			return "", errors.Wrapf(err, "failed to download file for hash generation, url=%s", u)
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()
 		}(r)
 		_, err = io.Copy(h, r)
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "failed to copy downloaded data to hash")
 		}
 	} else {
 		r, err := s.api.DownloadWithRange(dctx, u, 0, int(limitStart))
 		if err != nil {
-			return "", err
+			return "", errors.Wrapf(err, "failed to download file start for hash generation, url=%s, range=0-%d", u, limitStart)
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()
 		}(r)
 		_, err = io.Copy(h, r)
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "failed to copy file start data to hash")
 		}
 		r, err = s.api.DownloadWithRange(dctx, u, int(size-limitEnd), -1)
 		if err != nil {
-			return "", err
+			return "", errors.Wrapf(err, "failed to download file end for hash generation, url=%s, range=%d-end", u, size-limitEnd)
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()
 		}(r)
 		_, err = io.Copy(h, r)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to copy file end data to hash")
+		}
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
