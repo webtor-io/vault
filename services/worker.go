@@ -25,17 +25,18 @@ import (
 
 // Worker is a placeholder for background tasks (store/delete torrent data, update progress).
 type Worker struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	pg     *cs.PG
-	s3     *cs.S3Client
-	jobs   chan job
-	nwrks  int
-	api    *Api
-	bucket string
-	concur int
-	part   int64
-	nats   *cs.NATS
+	ctx        context.Context
+	cancel     context.CancelFunc
+	pg         *cs.PG
+	s3         *cs.S3Client
+	jobs       chan job
+	nwrks      int
+	api        *Api
+	bucket     string
+	concur     int
+	part       int64
+	nats       *cs.NATS
+	resourceID string
 }
 
 const (
@@ -43,6 +44,7 @@ const (
 	awsBucketFlag            = "aws-bucket"
 	awsUploadConcurrencyFlag = "aws-upload-concurrency"
 	awsUploadPartSizeFlag    = "aws-upload-part-size"
+	resourceIDFlag           = "resource-id"
 )
 
 // RegisterWorkerFlags registers CLI flags for the worker service.
@@ -68,8 +70,13 @@ func RegisterWorkerFlags(f []cli.Flag) []cli.Flag {
 		cli.Int64Flag{
 			Name:   awsUploadPartSizeFlag,
 			Usage:  "aws upload part size",
-			Value:  1024 * 1024 * 1024,
+			Value:  50 * 1000 * 1000,
 			EnvVar: "AWS_UPLOAD_PART_SIZE",
+		},
+		cli.StringFlag{
+			Name:   resourceIDFlag,
+			Usage:  "specific resource ID to process (for debugging)",
+			EnvVar: "RESOURCE_ID",
 		},
 	)
 }
@@ -83,17 +90,18 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NAT
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	w := &Worker{
-		ctx:    ctx,
-		cancel: cancel,
-		pg:     pgc,
-		s3:     s3,
-		nwrks:  c.Int(workerCountFlag),
-		jobs:   make(chan job, 1024),
-		api:    api,
-		bucket: c.String(awsBucketFlag),
-		concur: c.Int(awsUploadConcurrencyFlag),
-		part:   c.Int64(awsUploadPartSizeFlag),
-		nats:   nt,
+		ctx:        ctx,
+		cancel:     cancel,
+		pg:         pgc,
+		s3:         s3,
+		nwrks:      c.Int(workerCountFlag),
+		jobs:       make(chan job, 1024),
+		api:        api,
+		bucket:     c.String(awsBucketFlag),
+		concur:     c.Int(awsUploadConcurrencyFlag),
+		part:       c.Int64(awsUploadPartSizeFlag),
+		nats:       nt,
+		resourceID: c.String(resourceIDFlag),
 	}
 	// start worker pool
 	for i := 0; i < w.nwrks; i++ {
@@ -107,6 +115,18 @@ func (s *Worker) Serve() error {
 	db := s.pg.Get()
 	if db == nil {
 		return errors.New("db is not configured")
+	}
+	if s.resourceID != "" {
+		log.WithField("resource_id", s.resourceID).Info("Worker started in debug mode for specific resource (no time constraints, single run)")
+		// Process once and exit when specific resource ID is set
+		processErr := s.process(s.ctx, db)
+		if processErr != nil {
+			log.WithError(processErr).Error("Worker process error")
+			return processErr
+		}
+		log.Info("Worker finished processing specific resource")
+		select {}
+		//return nil
 	}
 	log.Info("Worker started")
 	ticker := time.NewTicker(5 * time.Second)
@@ -131,10 +151,16 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 	// Using FOR UPDATE SKIP LOCKED to avoid multiple workers picking up the same resource
 	var list []Resource
 	err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
-		err := tx.Model(&list).
+		q := tx.Model(&list).
 			Context(ctx).
-			Where("status != ?", StatusStored).
-			WhereGroup(func(q *pg.Query) (*pg.Query, error) {
+			Where("status != ?", StatusStored)
+
+		// If specific resource ID is set (for debugging), filter by it and skip time constraints
+		if s.resourceID != "" {
+			q = q.Where("resource_id = ?", s.resourceID)
+		} else {
+			// Apply normal time constraints only when not debugging specific resource
+			q = q.WhereGroup(func(q *pg.Query) (*pg.Query, error) {
 				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
 					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
 						Where("now() - updated_at > interval '30 minutes'"), nil
@@ -142,9 +168,10 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 					return q.Where("status NOT IN (?, ?)", StatusStoreError, StatusDeleteError).
 						Where("now() - updated_at > interval '1 minute'"), nil
 				}), nil
-			}).
-			For("UPDATE SKIP LOCKED").
-			Select()
+			})
+		}
+
+		err := q.For("UPDATE SKIP LOCKED").Select()
 		if err != nil && !errors.Is(err, pg.ErrNoRows) {
 			return errors.Wrap(err, "failed to select resources for processing")
 		}
@@ -698,13 +725,15 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		partNumber int64
 		data       []byte
 	}
-	type partResult struct {
-		completedPart *awss3.CompletedPart
-		err           error
-	}
 
 	jobs := make(chan partJob, s.concur)
-	results := make(chan partResult, s.concur)
+	var uploadErr error
+	var uploadErrOnce sync.Once
+	setUploadErr := func(err error) {
+		uploadErrOnce.Do(func() {
+			uploadErr = err
+		})
+	}
 	var wg sync.WaitGroup
 
 	for i := 0; i < s.concur; i++ {
@@ -735,41 +764,18 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 					}).WithError(err).Warn("failed to upload part, retrying")
 					time.Sleep(time.Second * time.Duration(i+1))
 				}
-				results <- partResult{
-					completedPart: &awss3.CompletedPart{
-						ETag:       upOut.ETag,
-						PartNumber: aws.Int64(pj.partNumber),
-					},
-					err: err,
+				if err != nil {
+					setUploadErr(errors.Wrapf(err, "failed to upload part, bucket=%s, key=%s, upload_id=%s, part_number=%d", s.bucket, hash, f.UploadID, pj.partNumber))
 				}
+				mu.Lock()
+				completedPartsMap[pj.partNumber] = &awss3.CompletedPart{
+					ETag:       upOut.ETag,
+					PartNumber: aws.Int64(pj.partNumber),
+				}
+				mu.Unlock()
 			}
 		}()
 	}
-
-	var uploadErr error
-	var uploadErrOnce sync.Once
-	setUploadErr := func(err error) {
-		uploadErrOnce.Do(func() {
-			uploadErr = err
-		})
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	go func() {
-		for res := range results {
-			if res.err != nil {
-				setUploadErr(res.err)
-				continue
-			}
-			mu.Lock()
-			completedPartsMap[*res.completedPart.PartNumber] = res.completedPart
-			mu.Unlock()
-		}
-	}()
 
 	for stored < f.TotalSize {
 		select {
