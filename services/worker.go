@@ -147,8 +147,9 @@ func (s *Worker) Serve() error {
 }
 
 func (s *Worker) process(ctx context.Context, db *pg.DB) error {
-	// 1. Get all resources queued for storing or deletion in one request
-	// Using FOR UPDATE SKIP LOCKED to avoid multiple workers picking up the same resource
+	// 1. Select resources and update their status inside a short transaction.
+	// Dispatch to the jobs channel happens outside the transaction to avoid
+	// holding FOR UPDATE locks while waiting on a potentially full channel.
 	var list []Resource
 	err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
 		q := tx.Model(&list).
@@ -171,7 +172,10 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 			})
 		}
 
-		err := q.For("UPDATE SKIP LOCKED").Select()
+		err := q.
+			Limit(s.nwrks * 2).
+			For("UPDATE SKIP LOCKED").
+			Select()
 		if err != nil && !errors.Is(err, pg.ErrNoRows) {
 			return errors.Wrap(err, "failed to select resources for processing")
 		}
@@ -186,9 +190,29 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to run transaction in process")
 	}
+
+	// 2. Dispatch jobs outside the transaction so we never block while holding row locks.
+	for _, r := range list {
+		var processingStatus Status
+		switch r.Status {
+		case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
+			processingStatus = StatusDeleting
+		case StatusQueuedForStoring, StatusStoring, StatusStoreError:
+			processingStatus = StatusStoring
+		default:
+			continue
+		}
+		select {
+		case s.jobs <- job{status: processingStatus, id: r.ID}:
+		case <-s.ctx.Done():
+			return nil
+		}
+	}
 	return nil
 }
 
+// processResource updates the resource status to processing inside the transaction.
+// Job dispatch to the channel is done later in process(), outside the transaction.
 func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) error {
 	log.WithField("id", r.ID).WithField("status", r.Status).Info("processing resource")
 	var processingStatus Status
@@ -221,10 +245,6 @@ func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) err
 
 	if _, err = tx.Model(cur).Context(ctx).Column("status", "updated_at").WherePK().Update(); err != nil {
 		return errors.Wrap(err, "failed to update resource status to processing")
-	}
-	select {
-	case s.jobs <- job{status: processingStatus, id: r.ID}:
-	case <-s.ctx.Done():
 	}
 	return nil
 }
