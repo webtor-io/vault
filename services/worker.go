@@ -174,6 +174,8 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		}
 
 		err := q.
+			OrderExpr("CASE WHEN status IN (?, ?) THEN 0 ELSE 1 END", StatusQueuedForStoring, StatusQueuedForDeletion).
+			Order("updated_at ASC").
 			Limit(s.nwrks * 2).
 			For("UPDATE SKIP LOCKED").
 			Select()
