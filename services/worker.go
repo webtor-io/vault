@@ -447,6 +447,16 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	if s.bucket == "" {
 		return errors.New("s3 bucket is not configured")
 	}
+	stopFlush := runPeriodicFlush(ctx, func() {
+		if _, err := db.Model(&Resource{ID: id}).
+			Context(ctx).
+			Set("updated_at = now()").
+			Where("resource_id = ?", id).
+			Update(); err != nil {
+			log.WithError(err).WithField("resource_id", id).Warn("delete heartbeat failed")
+		}
+	})
+	defer stopFlush()
 	// 1) Collect all files linked to this resource
 	var rfs []ResourceFile
 	if err := db.Model(&rfs).Context(ctx).Where("resource_id = ?", id).Select(); err != nil && !errors.Is(err, pg.ErrNoRows) {
@@ -554,6 +564,26 @@ func (s *Worker) handleError(_ context.Context, id string, err error, status Sta
 	}
 }
 
+// runPeriodicFlush calls fn every 10 seconds until the returned cancel
+// function is called. It is used to keep resource.updated_at fresh so that
+// other workers do not re-claim the same job.
+func runPeriodicFlush(ctx context.Context, fn func()) context.CancelFunc {
+	fctx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-fctx.Done():
+				return
+			case <-ticker.C:
+				fn()
+			}
+		}
+	}()
+	return cancel
+}
+
 func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64) (*File, error) {
 
 	if s.bucket == "" {
@@ -608,7 +638,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 		return nil
 	}
-	flushCtx, flushCancel := context.WithCancel(ctx)
 	var mu sync.Mutex
 	mu.Lock()
 	var completedParts []*awss3.CompletedPart
@@ -619,27 +648,18 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		partSize = 5 * 1024 * 1024
 	}
 
-	defer flushCancel()
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-flushCtx.Done():
-				return
-			case <-ticker.C:
-				mu.Lock()
-				currentStored := int64(len(completedPartsMap)) * partSize
-				mu.Unlock()
-				if currentStored > item.Size {
-					currentStored = item.Size
-				}
-				if err := flush(currentStored); err != nil {
-					log.WithError(err).Error("periodic flush progress failed")
-				}
-			}
+	stopFlush := runPeriodicFlush(ctx, func() {
+		mu.Lock()
+		currentStored := int64(len(completedPartsMap)) * partSize
+		mu.Unlock()
+		if currentStored > item.Size {
+			currentStored = item.Size
 		}
-	}()
+		if err := flush(currentStored); err != nil {
+			log.WithError(err).Error("periodic flush progress failed")
+		}
+	})
+	defer stopFlush()
 	if err := flush(0); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
 	}
