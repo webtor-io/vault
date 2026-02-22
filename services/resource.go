@@ -1,11 +1,11 @@
 package services
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 // PUT /resource/{id} — queue storing of a resource (id = infohash)
@@ -26,8 +26,14 @@ func (s *Web) putResource(c *gin.Context) {
 	}
 	res, err := ResourceQueueForStoring(c.Request.Context(), db, id)
 	if err != nil {
+		if aerr := APILogWrite(c.Request.Context(), db, id, OperationStore, http.StatusInternalServerError); aerr != nil {
+			log.WithError(aerr).WithField("resource_id", id).Warn("failed to write api log")
+		}
 		_ = c.Error(err)
 		return
+	}
+	if aerr := APILogWrite(c.Request.Context(), db, id, OperationStore, http.StatusAccepted); aerr != nil {
+		log.WithError(aerr).WithField("resource_id", id).Warn("failed to write api log")
 	}
 	c.JSON(http.StatusAccepted, res)
 }
@@ -75,14 +81,23 @@ func (s *Web) deleteResource(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	res, err := ResourceQueueForDeletion(context.Background(), db, id)
+	res, err := ResourceQueueForDeletion(c.Request.Context(), db, id)
 	if err != nil {
+		if aerr := APILogWrite(c.Request.Context(), db, id, OperationDelete, http.StatusInternalServerError); aerr != nil {
+			log.WithError(aerr).WithField("resource_id", id).Warn("failed to write api log")
+		}
 		_ = c.Error(err)
 		return
 	}
 	if res == nil {
+		if aerr := APILogWrite(c.Request.Context(), db, id, OperationDelete, http.StatusNotFound); aerr != nil {
+			log.WithError(aerr).WithField("resource_id", id).Warn("failed to write api log")
+		}
 		c.Status(http.StatusNotFound)
 		return
+	}
+	if aerr := APILogWrite(c.Request.Context(), db, id, OperationDelete, http.StatusAccepted); aerr != nil {
+		log.WithError(aerr).WithField("resource_id", id).Warn("failed to write api log")
 	}
 	c.JSON(http.StatusAccepted, res)
 }

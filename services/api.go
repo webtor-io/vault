@@ -17,7 +17,7 @@ import (
 
 	ra "github.com/webtor-io/rest-api/services"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
@@ -88,7 +88,7 @@ func RegisterApiFlags(f []cli.Flag) []cli.Flag {
 }
 
 type Claims struct {
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 	Rate          string `json:"rate,omitempty"`
 	Role          string `json:"role,omitempty"`
 	SessionID     string `json:"sessionID"`
@@ -295,6 +295,9 @@ func (s *Api) DownloadWithRange(ctx context.Context, u string, start int, end in
 		log.WithError(err).Error("failed to do request")
 		return nil, err
 	}
-	b := res.Body
-	return b, nil
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
+		_ = res.Body.Close()
+		return nil, errors.Errorf("unexpected status %d downloading url=%s", res.StatusCode, req.URL.String())
+	}
+	return res.Body, nil
 }

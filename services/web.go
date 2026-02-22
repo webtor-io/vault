@@ -1,10 +1,10 @@
 package services
 
 import (
+	stderrors "errors"
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
@@ -14,6 +14,14 @@ import (
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
 	"github.com/webtor-io/vault/docs"
+)
+
+// Sentinel errors for HTTP status code mapping.
+var (
+	ErrBadRequest = stderrors.New("bad request")
+	ErrForbidden  = stderrors.New("forbidden")
+	ErrNotFound   = stderrors.New("not found")
+	ErrTimeout    = stderrors.New("timeout")
 )
 
 // @title           Vault API
@@ -99,21 +107,23 @@ func (s *Web) errorHandler(c *gin.Context) {
 	if len(c.Errors) == 0 {
 		return
 	}
-	err := c.Errors[0]
-	log.Error(err)
+	ginErr := c.Errors[0]
+	log.Error(ginErr)
 
 	status := http.StatusInternalServerError
+	unwrapped := ginErr.Err
 
-	if strings.Contains(err.Error(), "failed to parse") {
+	switch {
+	case stderrors.Is(unwrapped, ErrBadRequest):
 		status = http.StatusBadRequest
-	} else if strings.Contains(err.Error(), "forbidden") {
+	case stderrors.Is(unwrapped, ErrForbidden):
 		status = http.StatusForbidden
-	} else if strings.Contains(err.Error(), "not found") {
+	case stderrors.Is(unwrapped, ErrNotFound):
 		status = http.StatusNotFound
-	} else if strings.Contains(err.Error(), "timeout") {
+	case stderrors.Is(unwrapped, ErrTimeout):
 		status = http.StatusRequestTimeout
 	}
-	c.PureJSON(status, &ErrorResponse{Error: err.Error()})
+	c.PureJSON(status, &ErrorResponse{Error: ginErr.Error()})
 }
 
 func (s *Web) Close() {

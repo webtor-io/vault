@@ -3,11 +3,21 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	pg "github.com/go-pg/pg/v10"
 	"github.com/google/uuid"
 )
+
+// IsPGDuplicateKey checks whether the error is a PostgreSQL unique constraint violation (code 23505).
+func IsPGDuplicateKey(err error) bool {
+	var pgErr pg.Error
+	if errors.As(err, &pgErr) {
+		return pgErr.IntegrityViolation()
+	}
+	return false
+}
 
 type Status int16
 
@@ -22,8 +32,13 @@ const (
 	StatusDeleteError
 )
 
+var statusNames = []string{"queued_for_storing", "storing", "stored", "store_error", "queued_for_deletion", "deleting", "delete_error"}
+
 func (s Status) String() string {
-	return []string{"queued_for_storing", "storing", "stored", "store_error", "queued_for_deletion", "deleting", "delete_error"}[s]
+	if int(s) < 0 || int(s) >= len(statusNames) {
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+	return statusNames[s]
 }
 
 // OperationType represents the type of operation performed on a resource.
@@ -103,9 +118,9 @@ type ResourceFile struct {
 
 // Helper methods for working with the DB using go-pg. These are simple helpers instead of a separate repo layer.
 
-// OperationLog stores audit information about store/delete operations on resources.
-type OperationLog struct {
-	tableName     struct{}      `pg:"log"`
+// WorkerLog stores audit information about store/delete operations on resources.
+type WorkerLog struct {
+	tableName     struct{}      `pg:"worker_log"`
 	LogID         uuid.UUID     `json:"log_id" pg:"log_id,pk,type:uuid"`
 	OperationType OperationType `json:"operation_type" pg:"operation_type,use_zero"`
 	StartedAt     time.Time     `json:"started_at" pg:"started_at,notnull,default:now()"`
@@ -118,22 +133,22 @@ type OperationLog struct {
 	ErrorText *string `json:"error_text,omitempty" pg:"error_text"`
 }
 
-// LogOperationStart creates a new operation log entry and returns it.
-func LogOperationStart(ctx context.Context, db *pg.DB, resourceID string, s Status) (*OperationLog, error) {
+// WorkerLogStart creates a new worker log entry and returns it.
+func WorkerLogStart(ctx context.Context, db *pg.DB, resourceID string, s Status) (*WorkerLog, error) {
 	op := OperationStore
 	if s == StatusDeleting {
 		op = OperationDelete
 	}
-	l := &OperationLog{ResourceID: resourceID, OperationType: op}
+	l := &WorkerLog{ResourceID: resourceID, OperationType: op}
 	if _, err := db.Model(l).Context(ctx).Insert(); err != nil {
 		return nil, err
 	}
 	return l, nil
 }
 
-// LogOperationFinish sets finished_at to NOW() and stores status and error_text for the specified log entry.
-func LogOperationFinish(ctx context.Context, db *pg.DB, logID uuid.UUID, oerr error) (err error) {
-	l := &OperationLog{LogID: logID}
+// WorkerLogFinish sets finished_at to NOW() and stores status and error_text for the specified worker log entry.
+func WorkerLogFinish(ctx context.Context, db *pg.DB, logID uuid.UUID, oerr error) (err error) {
+	l := &WorkerLog{LogID: logID}
 	if oerr != nil {
 		_, err = db.Model(l).Context(ctx).
 			Set("finished_at = now()").
@@ -149,6 +164,27 @@ func LogOperationFinish(ctx context.Context, db *pg.DB, logID uuid.UUID, oerr er
 			Update()
 	}
 	return
+}
+
+// APILog stores audit information about incoming HTTP requests for store/delete operations.
+type APILog struct {
+	tableName     struct{}      `pg:"api_log"`
+	APILogID      uuid.UUID     `json:"api_log_id" pg:"api_log_id,pk,type:uuid"`
+	OperationType OperationType `json:"operation_type" pg:"operation_type,use_zero"`
+	ResourceID    string        `json:"resource_id" pg:"resource_id"`
+	HTTPStatus    int16         `json:"http_status" pg:"http_status,use_zero"`
+	CreatedAt     time.Time     `json:"created_at" pg:"created_at,notnull,default:now()"`
+}
+
+// APILogWrite writes an API log entry. Errors are non-fatal and returned for the caller to log.
+func APILogWrite(ctx context.Context, db *pg.DB, resourceID string, operationType OperationType, httpStatus int16) error {
+	l := &APILog{
+		ResourceID:    resourceID,
+		OperationType: operationType,
+		HTTPStatus:    httpStatus,
+	}
+	_, err := db.Model(l).Context(ctx).Insert()
+	return err
 }
 
 // ResourceQueueForStoring inserts a new resource with queued status or updates existing to queued.

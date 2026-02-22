@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -62,7 +63,9 @@ func serve(c *cli.Context) (err error) {
 		defer pprof.Close()
 	}
 
-	cl := http.DefaultClient
+	cl := &http.Client{
+		Timeout: 30 * time.Minute,
+	}
 
 	// Setting S3Client
 	s3c := cs.NewS3Client(c, cl)

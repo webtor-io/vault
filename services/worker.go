@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +36,7 @@ type Worker struct {
 	part       int64
 	nats       *cs.NATS
 	resourceID string
+	wg         sync.WaitGroup
 }
 
 const (
@@ -103,10 +103,6 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NAT
 		nats:       nt,
 		resourceID: c.String(resourceIDFlag),
 	}
-	// start worker pool
-	for i := 0; i < w.nwrks; i++ {
-		go w.workerLoop()
-	}
 	return w
 }
 
@@ -115,6 +111,11 @@ func (s *Worker) Serve() error {
 	db := s.pg.Get()
 	if db == nil {
 		return errors.New("db is not configured")
+	}
+	// Start worker pool now that all dependencies are ready.
+	for i := 0; i < s.nwrks; i++ {
+		s.wg.Add(1)
+		go s.workerLoop()
 	}
 	if s.resourceID != "" {
 		log.WithField("resource_id", s.resourceID).Info("Worker started in debug mode for specific resource (no time constraints, single run)")
@@ -125,8 +126,8 @@ func (s *Worker) Serve() error {
 			return processErr
 		}
 		log.Info("Worker finished processing specific resource")
-		select {}
-		//return nil
+		<-s.ctx.Done()
+		return nil
 	}
 	log.Info("Worker started")
 	ticker := time.NewTicker(5 * time.Second)
@@ -252,20 +253,23 @@ func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) err
 func (s *Worker) Close() {
 	log.Info("closing Worker")
 	s.cancel()
+	s.wg.Wait()
+	log.Info("Worker closed")
 }
 
 func (s *Worker) jobCancelContext(inCtx context.Context, db *pg.DB, j job) (ctx context.Context, cancel context.CancelFunc) {
 	ctx, cancel = context.WithCancel(inCtx)
-	t := time.NewTimer(5 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	go func() {
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
+			case <-ticker.C:
 				res := &Resource{ID: j.id}
 				err := db.Model(res).
-					Context(ctx).
+					Context(inCtx).
 					WherePK().
 					Where("status = ?", j.status).
 					Select()
@@ -285,15 +289,15 @@ func (s *Worker) jobCancelContext(inCtx context.Context, db *pg.DB, j job) (ctx 
 func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 	ctx, cancel := s.jobCancelContext(ctx, db, j)
 	defer cancel()
-	opLog, err := LogOperationStart(ctx, db, j.id, j.status)
+	opLog, err := WorkerLogStart(ctx, db, j.id, j.status)
 	if err != nil {
-		log.WithError(err).WithField("resource_id", j.id).Warn("failed to create operation log")
+		log.WithError(err).WithField("resource_id", j.id).Warn("failed to create worker log")
 	}
 	if opLog != nil {
 		defer func() {
-			lerr := LogOperationFinish(ctx, db, opLog.LogID, err)
+			lerr := WorkerLogFinish(ctx, db, opLog.LogID, err)
 			if lerr != nil {
-				log.WithError(lerr).WithField("log_id", opLog.LogID).Warn("failed to finish operation log")
+				log.WithError(lerr).WithField("log_id", opLog.LogID).Warn("failed to finish worker log")
 			}
 		}()
 	}
@@ -310,9 +314,8 @@ func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 			nc := s.nats.Get()
 			if nc != nil {
 				b, _ := json.Marshal(map[string]string{"resource_id": j.id})
-				err = nc.Publish("resource.vaulted", b)
-				if err != nil {
-					log.WithError(err).WithField("id", j.id).Error("failed to publish nats message")
+				if pubErr := nc.Publish("resource.vaulted", b); pubErr != nil {
+					log.WithError(pubErr).WithField("id", j.id).Error("failed to publish nats message")
 				}
 			}
 		}
@@ -331,6 +334,7 @@ func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
 }
 
 func (s *Worker) workerLoop() {
+	defer s.wg.Done()
 	db := s.pg.Get()
 	for {
 		select {
@@ -366,6 +370,14 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		return errors.Wrap(err, "failed to reset resource counters")
 	}
 
+	// Clean up old resource_file links to avoid orphans on re-store
+	if _, err := db.Model((*ResourceFile)(nil)).
+		Context(ctx).
+		Where("resource_id = ?", id).
+		Delete(); err != nil {
+		return errors.Wrap(err, "failed to clean up old resource_file links")
+	}
+
 	var totalSize, totalStored int64
 	// Paginate through results to find the file at the specified index
 	for {
@@ -394,7 +406,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 				if _, err := db.Model(&Resource{ID: id}).
 					Context(ctx).
 					Set("stored_size = ?", totalStored).
-					Set("error = ?", "").
+					Set("error = null").
 					Where("resource_id = ?", id).
 					Update(); err != nil {
 					return errors.Wrap(err, "failed to update resource stored_size")
@@ -405,16 +417,14 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 					Path:       item.PathStr,
 				}
 				_, err = db.Model(rf).Insert()
-				if err != nil && !strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+				if err != nil && !IsPGDuplicateKey(err) {
 					return errors.Wrap(err, "failed to insert resource_file")
-				} else if err != nil {
-					continue
 				}
 			}
 		}
 
 		// Check if we've reached the end
-		if (resp.Count - int(listArgs.Offset)) == len(resp.Items) {
+		if len(resp.Items) < int(listArgs.Limit) {
 			break
 		}
 
@@ -508,19 +518,39 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	return nil
 }
 
-func (s *Worker) handleError(ctx context.Context, id string, err error, status Status) {
+func (s *Worker) handleError(_ context.Context, id string, err error, status Status) {
 	db := s.pg.Get()
-	// Change status from storing to stored
 	errMsg := err.Error()
+	// Determine which processing status we expect the resource to still be in.
+	// Only overwrite if the resource is still in that processing state —
+	// otherwise an external status change (e.g. QueuedForDeletion) would be lost.
+	var expectedStatus Status
+	switch status {
+	case StatusStoreError:
+		expectedStatus = StatusStoring
+	case StatusDeleteError:
+		expectedStatus = StatusDeleting
+	default:
+		expectedStatus = status
+	}
+	// Use a fresh context with timeout — the job context may already be cancelled.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	res := &Resource{ID: id, Error: &errMsg, Status: status}
-	_, upErr := db.Model(res).
+	result, upErr := db.Model(res).
 		Context(ctx).
 		Column("status").
 		Column("error").
 		Where("resource_id = ?", id).
+		Where("status = ?", expectedStatus).
 		Update()
 	if upErr != nil {
 		log.WithError(upErr).Error("update error status failed")
+	} else if result.RowsAffected() == 0 {
+		log.WithFields(log.Fields{
+			"id":              id,
+			"expected_status": expectedStatus.String(),
+		}).Warn("skipped error status update: resource status changed externally")
 	}
 }
 
@@ -636,7 +666,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return f, nil
 	}
 	_, err = db.Model(f).Context(ctx).Insert()
-	if err != nil && !strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+	if err != nil && !IsPGDuplicateKey(err) {
 		return nil, errors.Wrap(err, "failed to insert file")
 	}
 
@@ -786,6 +816,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				}
 				if err != nil {
 					setUploadErr(errors.Wrapf(err, "failed to upload part, bucket=%s, key=%s, upload_id=%s, part_number=%d", s.bucket, hash, f.UploadID, pj.partNumber))
+					continue
 				}
 				mu.Lock()
 				completedPartsMap[pj.partNumber] = &awss3.CompletedPart{
