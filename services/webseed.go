@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -59,12 +60,36 @@ func (s *Web) webSeed(c *gin.Context) {
 		return
 	}
 
-	presignedURL, err := s.presignGetObject(hash)
+	if c.Request.Method == http.MethodHead {
+		s.handleHeadRequest(c, hash)
+	} else {
+		presignedURL, err := s.presignGetObject(hash)
+		if err != nil {
+			_ = c.Error(err)
+			return
+		}
+		c.Redirect(http.StatusFound, presignedURL)
+	}
+}
+
+func (s *Web) handleHeadRequest(c *gin.Context, hash string) {
+	s3cl := s.s3.Get()
+	out, err := s3cl.HeadObjectWithContext(c.Request.Context(), &awss3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(hash),
+	})
 	if err != nil {
 		_ = c.Error(err)
 		return
 	}
-	c.Redirect(http.StatusFound, presignedURL)
+	if out.ContentLength != nil {
+		c.Header("Content-Length", fmt.Sprintf("%d", *out.ContentLength))
+	}
+	if out.ContentType != nil {
+		c.Header("Content-Type", *out.ContentType)
+	}
+	c.Header("Accept-Ranges", "bytes")
+	c.Status(http.StatusOK)
 }
 
 func (s *Web) validateWebSeedDependencies(c *gin.Context) bool {
