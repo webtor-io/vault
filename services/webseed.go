@@ -2,28 +2,25 @@ package services
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/gin-gonic/gin"
 	"github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
 )
+
+const presignTTL = 1 * time.Hour
 
 // WebSeed handler — GET/HEAD /webseed/{id}/{path}
 // @Summary      Webseed proxy
-// @Description  Proxies stored files from S3 with Range support. Returns 404 if resource is not fully stored or file not found.
+// @Description  Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.
 // @Tags         webseed
 // @Param        id    path      string  true  "Resource ID"
 // @Param        path  path      string  true  "Path inside resource"
-// @Produce      application/octet-stream
-// @Success      200
-// @Success      206
+// @Success      302
 // @Failure      404  {object}  ErrorResponse
 // @Failure      500  {object}  ErrorResponse
 // @Router       /webseed/{id}/{path} [get]
@@ -62,12 +59,12 @@ func (s *Web) webSeed(c *gin.Context) {
 		return
 	}
 
-	rangeHeader := c.GetHeader("Range")
-	if c.Request.Method == http.MethodHead {
-		s.handleHeadRequest(c, hash, rangeHeader)
-	} else {
-		s.handleGetRequest(c, hash, rangeHeader, id, p)
+	presignedURL, err := s.presignGetObject(hash)
+	if err != nil {
+		_ = c.Error(err)
+		return
 	}
+	c.Redirect(http.StatusFound, presignedURL)
 }
 
 func (s *Web) validateWebSeedDependencies(c *gin.Context) bool {
@@ -97,115 +94,11 @@ func (s *Web) lookupFileHash(ctx context.Context, db *pg.DB, id, path string) (s
 	return rf.FileHash, true, nil
 }
 
-func (s *Web) handleHeadRequest(c *gin.Context, hash, rangeHeader string) {
+func (s *Web) presignGetObject(hash string) (string, error) {
 	s3cl := s.s3.Get()
-	input := &awss3.HeadObjectInput{
+	req, _ := s3cl.GetObjectRequest(&awss3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(hash),
-		Range:  s.buildRangePointer(rangeHeader),
-	}
-	req, out := s3cl.HeadObjectRequest(input)
-	if err := req.Send(); err != nil {
-		if s.isS3NotFoundError(err) {
-			c.Status(http.StatusNotFound)
-			return
-		}
-		_ = c.Error(err)
-		return
-	}
-
-	s.setHeadResponseHeaders(c, out)
-	status := http.StatusOK
-	if req.HTTPResponse != nil && req.HTTPResponse.StatusCode == http.StatusPartialContent {
-		status = http.StatusPartialContent
-	}
-	c.Status(status)
-}
-
-func (s *Web) handleGetRequest(c *gin.Context, hash, rangeHeader, id, path string) {
-	s3cl := s.s3.Get()
-	out, err := s3cl.GetObjectWithContext(c.Request.Context(), &awss3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(hash),
-		Range:  s.buildRangePointer(rangeHeader),
 	})
-	if err != nil {
-		if s.isS3NotFoundError(err) {
-			c.Status(http.StatusNotFound)
-			return
-		}
-		_ = c.Error(err)
-		return
-	}
-	defer func() { _ = out.Body.Close() }()
-
-	s.setGetResponseHeaders(c, out)
-	status := http.StatusOK
-	if rangeHeader != "" && out.ContentRange != nil {
-		status = http.StatusPartialContent
-	}
-	c.Status(status)
-
-	n, err := io.Copy(c.Writer, out.Body)
-	if err != nil {
-		log.WithError(err).WithField("id", id).WithField("path", path).Warn("webseed stream error")
-	}
-	log.WithField("id", id).WithField("path", path).WithField("bytes", n).Debug("webseed stream finished")
-}
-
-func (s *Web) buildRangePointer(rangeHeader string) *string {
-	if rangeHeader != "" {
-		return aws.String(rangeHeader)
-	}
-	return nil
-}
-
-func (s *Web) isS3NotFoundError(err error) bool {
-	return strings.Contains(err.Error(), awss3.ErrCodeNoSuchKey) ||
-		strings.Contains(strings.ToLower(err.Error()), "not found")
-}
-
-func (s *Web) setHeadResponseHeaders(c *gin.Context, out *awss3.HeadObjectOutput) {
-	if out.AcceptRanges != nil {
-		c.Header("Accept-Ranges", *out.AcceptRanges)
-	} else {
-		c.Header("Accept-Ranges", "bytes")
-	}
-	if out.ContentType != nil {
-		c.Header("Content-Type", *out.ContentType)
-	}
-	if out.ETag != nil {
-		c.Header("ETag", *out.ETag)
-	}
-	if out.LastModified != nil {
-		c.Header("Last-Modified", out.LastModified.UTC().Format(http.TimeFormat))
-	}
-	if out.ContentLength != nil {
-		c.Header("Content-Length", fmt.Sprintf("%d", *out.ContentLength))
-	}
-}
-
-func (s *Web) setGetResponseHeaders(c *gin.Context, out *awss3.GetObjectOutput) {
-	if out.AcceptRanges != nil {
-		c.Header("Accept-Ranges", *out.AcceptRanges)
-	} else {
-		c.Header("Accept-Ranges", "bytes")
-	}
-	if out.ContentType != nil {
-		c.Header("Content-Type", *out.ContentType)
-	} else {
-		c.Header("Content-Type", "application/octet-stream")
-	}
-	if out.ETag != nil {
-		c.Header("ETag", *out.ETag)
-	}
-	if out.LastModified != nil {
-		c.Header("Last-Modified", out.LastModified.UTC().Format(http.TimeFormat))
-	}
-	if out.ContentLength != nil {
-		c.Header("Content-Length", fmt.Sprintf("%d", *out.ContentLength))
-	}
-	if out.ContentRange != nil {
-		c.Header("Content-Range", *out.ContentRange)
-	}
+	return req.Presign(presignTTL)
 }
