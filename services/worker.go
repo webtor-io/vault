@@ -37,6 +37,7 @@ type Worker struct {
 	nats       *cs.NATS
 	resourceID string
 	wg         sync.WaitGroup
+	pending    sync.Map // tracks resource IDs with pending/active jobs
 }
 
 const (
@@ -205,6 +206,10 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		default:
 			continue
 		}
+		// Skip if this resource already has a pending or active job.
+		if _, loaded := s.pending.LoadOrStore(r.ID, struct{}{}); loaded {
+			continue
+		}
 		select {
 		case s.jobs <- job{status: processingStatus, id: r.ID}:
 		case <-s.ctx.Done():
@@ -347,6 +352,7 @@ func (s *Worker) workerLoop() {
 			if err != nil {
 				log.WithError(err).Error("process job failed")
 			}
+			s.pending.Delete(j.id)
 		}
 	}
 }
