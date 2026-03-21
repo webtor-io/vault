@@ -352,6 +352,20 @@ func (s *Worker) workerLoop() {
 }
 
 func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err error) {
+	// Keep updated_at fresh from the very start to prevent other workers
+	// from re-claiming this resource during slow initial operations
+	// (ListResourceContent, generateFileHash).
+	stopFlush := runPeriodicFlush(ctx, func() {
+		if _, err := db.Model(&Resource{ID: id}).
+			Context(ctx).
+			Set("updated_at = now()").
+			Where("resource_id = ?", id).
+			Update(); err != nil {
+			log.WithError(err).WithField("resource_id", id).Warn("store heartbeat failed")
+		}
+	})
+	defer stopFlush()
+
 	listArgs := &ListResourceContentArgs{
 		Limit:  100,
 		Offset: 0,
