@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -22,13 +23,30 @@ import (
 	ra "github.com/webtor-io/rest-api/services"
 )
 
-// Worker is a placeholder for background tasks (store/delete torrent data, update progress).
+// Lease parameters for worker claim. See migration 8_resource_claim.up.sql
+// for the rationale. The lease duration must be larger than the heartbeat
+// interval times several ticks so a transient DB hiccup does not cause a
+// worker to lose its lease while it is still alive.
+const (
+	leaseDuration     = 2 * time.Minute
+	leaseHeartbeat    = 30 * time.Second
+	claimIdleSleep    = 5 * time.Second
+	storeErrorBackoff = 30 * time.Minute
+)
+
+// Worker processes background store and delete jobs for vault resources.
+// Each worker goroutine runs an independent claim loop that acquires a
+// lease on exactly one resource at a time via an atomic UPDATE ...
+// RETURNING against the resource.claim_expires_at column, then processes
+// it while a heartbeat goroutine refreshes the lease every leaseHeartbeat.
+// On crash, shutdown or stuck upstream, the lease expires naturally and
+// another worker can take over from wherever the previous one left off
+// (multipart upload resumes via ListPartsPages).
 type Worker struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	pg         *cs.PG
 	s3         *cs.S3Client
-	jobs       chan job
 	nwrks      int
 	api        *Api
 	bucket     string
@@ -36,8 +54,8 @@ type Worker struct {
 	part       int64
 	nats       *cs.NATS
 	resourceID string
+	workerBase string // hostname-derived prefix, suffixed with goroutine index
 	wg         sync.WaitGroup
-	pending    sync.Map // tracks resource IDs with pending/active jobs
 }
 
 const (
@@ -82,319 +100,379 @@ func RegisterWorkerFlags(f []cli.Flag) []cli.Flag {
 	)
 }
 
-type job struct {
-	status Status
-	id     string
-}
-
 func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NATS) *Worker {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
+	// Use HOSTNAME (Kubernetes injects the pod name by default) as the
+	// base component of the lease owner identifier. Each worker goroutine
+	// will append its index so leases are traceable to a specific
+	// goroutine on a specific pod.
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "vault-unknown"
+	}
 	w := &Worker{
-		ctx:    ctx,
-		cancel: cancel,
-		pg:     pgc,
-		s3:     s3,
-		nwrks:  c.Int(workerCountFlag),
-		// Unbuffered channel: process() blocks on dispatch until a worker
-		// is actually ready to run handleStore. This keeps the window
-		// between status=storing (set in processResource) and the start
-		// of runPeriodicFlush (inside handleStore) minimal, preventing
-		// cross-pod re-claims caused by stale updated_at during queue wait.
-		jobs:       make(chan job),
+		ctx:        ctx,
+		cancel:     cancel,
+		pg:         pgc,
+		s3:         s3,
+		nwrks:      c.Int(workerCountFlag),
 		api:        api,
 		bucket:     c.String(awsBucketFlag),
 		concur:     c.Int(awsUploadConcurrencyFlag),
 		part:       c.Int64(awsUploadPartSizeFlag),
 		nats:       nt,
 		resourceID: c.String(resourceIDFlag),
+		workerBase: host,
 	}
 	return w
 }
 
-// Serve runs the worker loop until ctx is done.
+// Serve starts nwrks independent claim loops. Each goroutine has its own
+// full worker identifier ({hostname}#{index}) that becomes the value of
+// resource.claimed_by when it acquires a lease. The Go runtime does the
+// scheduling across CPUs; the claim loop itself is simple — try to claim
+// one resource, process it, repeat, and sleep claimIdleSleep when the
+// queue is empty.
 func (s *Worker) Serve() error {
 	db := s.pg.Get()
 	if db == nil {
 		return errors.New("db is not configured")
 	}
-	// Start worker pool now that all dependencies are ready.
-	for i := 0; i < s.nwrks; i++ {
-		s.wg.Add(1)
-		go s.workerLoop()
-	}
 	if s.resourceID != "" {
-		log.WithField("resource_id", s.resourceID).Info("Worker started in debug mode for specific resource (no time constraints, single run)")
-		// Process once and exit when specific resource ID is set
-		processErr := s.process(s.ctx, db)
-		if processErr != nil {
-			log.WithError(processErr).Error("Worker process error")
-			return processErr
+		log.WithField("resource_id", s.resourceID).
+			Info("Worker started in debug mode for specific resource")
+		workerID := s.workerBase + "#debug"
+		res, err := s.tryClaim(s.ctx, db, workerID)
+		if err != nil {
+			return errors.Wrap(err, "debug claim failed")
 		}
-		log.Info("Worker finished processing specific resource")
+		if res == nil {
+			log.Info("debug mode: nothing to claim for the specified resource_id")
+		} else {
+			s.processClaimed(s.ctx, db, res, workerID)
+		}
 		<-s.ctx.Done()
 		return nil
 	}
-	log.Info("Worker started")
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.ctx.Done():
-			log.Info("Worker stopped")
-			return nil
-		case <-ticker.C:
-			processErr := s.process(s.ctx, db)
-			if processErr != nil {
-				log.WithError(processErr).Error("Worker process error")
-			}
-			log.Debug("Worker tick")
-		}
+	log.WithField("workers", s.nwrks).Info("Worker started")
+	for i := 0; i < s.nwrks; i++ {
+		s.wg.Add(1)
+		workerID := fmt.Sprintf("%s#%d", s.workerBase, i)
+		go s.claimLoop(workerID)
 	}
-}
-
-func (s *Worker) process(ctx context.Context, db *pg.DB) error {
-	// 1. Select resources and update their status inside a short transaction.
-	// Dispatch to the jobs channel happens outside the transaction to avoid
-	// holding FOR UPDATE locks while waiting on a potentially full channel.
-	var list []Resource
-	err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
-		q := tx.Model(&list).
-			Context(ctx).
-			Where("status != ?", StatusStored)
-
-		// If specific resource ID is set (for debugging), filter by it and skip time constraints
-		if s.resourceID != "" {
-			q = q.Where("resource_id = ?", s.resourceID)
-		} else {
-			// Apply time constraints per status class:
-			//
-			// - queued_for_storing / queued_for_deletion: NO time constraint.
-			//   These are brand-new jobs submitted via PUT/DELETE /resource.
-			//   They must be picked up on the next tick (≤5s) so users don't
-			//   wait for a reclaim window before processing starts.
-			//
-			// - storing / deleting: reclaim only after 15 minutes of no
-			//   updated_at change. The runPeriodicFlush heartbeat in
-			//   handleStore/handleDelete ticks every 10s, so a live worker
-			//   keeps the row fresh. 15 minutes gives ample slack for slow
-			//   metadata ops (generateFileHash, ListResourceContent) on huge
-			//   files while still recovering from a truly dead pod. Raised
-			//   from the original 1 minute to fix cross-pod double-claim
-			//   races when a job spent time in the jobs channel before
-			//   handleStore actually started ticking the heartbeat.
-			//
-			// - store_error / delete_error: retry after 30 minutes of backoff.
-			q = q.WhereGroup(func(q *pg.Query) (*pg.Query, error) {
-				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status IN (?, ?)", StatusQueuedForStoring, StatusQueuedForDeletion), nil
-				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status IN (?, ?)", StatusStoring, StatusDeleting).
-						Where("now() - updated_at > interval '15 minutes'"), nil
-				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
-						Where("now() - updated_at > interval '30 minutes'"), nil
-				}), nil
-			})
-		}
-
-		err := q.
-			OrderExpr("CASE WHEN status IN (?, ?) THEN 0 ELSE 1 END", StatusQueuedForStoring, StatusQueuedForDeletion).
-			Order("updated_at ASC").
-			Limit(s.nwrks * 2).
-			For("UPDATE SKIP LOCKED").
-			Select()
-		if err != nil && !errors.Is(err, pg.ErrNoRows) {
-			return errors.Wrap(err, "failed to select resources for processing")
-		}
-		for _, r := range list {
-			if err := s.processResource(ctx, tx, r); err != nil {
-				log.WithError(err).WithField("id", r.ID).Error("process resource failed")
-				continue
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return errors.Wrap(err, "failed to run transaction in process")
-	}
-
-	// 2. Dispatch jobs outside the transaction so we never block while holding row locks.
-	for _, r := range list {
-		var processingStatus Status
-		switch r.Status {
-		case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
-			processingStatus = StatusDeleting
-		case StatusQueuedForStoring, StatusStoring, StatusStoreError:
-			processingStatus = StatusStoring
-		default:
-			continue
-		}
-		// Skip if this resource already has a pending or active job.
-		if _, loaded := s.pending.LoadOrStore(r.ID, struct{}{}); loaded {
-			continue
-		}
-		select {
-		case s.jobs <- job{status: processingStatus, id: r.ID}:
-		case <-s.ctx.Done():
-			return nil
-		}
-	}
+	<-s.ctx.Done()
+	log.Info("Worker stopped")
 	return nil
 }
 
-// processResource updates the resource status to processing inside the transaction.
-// Job dispatch to the channel is done later in process(), outside the transaction.
-func (s *Worker) processResource(ctx context.Context, tx *pg.Tx, r Resource) error {
-	log.WithField("id", r.ID).WithField("status", r.Status).Info("processing resource")
-	var processingStatus Status
-	switch r.Status {
-	case StatusQueuedForDeletion, StatusDeleting, StatusDeleteError:
-		processingStatus = StatusDeleting
-	case StatusQueuedForStoring, StatusStoring, StatusStoreError:
-		processingStatus = StatusStoring
-	default:
-		return fmt.Errorf("unexpected resource status: %s", r.Status)
-	}
-
-	// For update with status check avoids taking rows already processed
-	cur := &Resource{}
-	err := tx.Model(cur).
-		Context(ctx).
-		Where("resource_id = ?", r.ID).
-		Where("status = ?", r.Status).
-		Where("updated_at = ?", r.UpdatedAt).
-		Select()
-	if err != nil {
-		if errors.Is(err, pg.ErrNoRows) {
-			return nil
-		}
-		return errors.Wrap(err, "failed to select resource for update")
-	}
-	cur.ID = r.ID
-	cur.Status = processingStatus
-	cur.UpdatedAt = time.Now()
-
-	if _, err = tx.Model(cur).Context(ctx).Column("status", "updated_at").WherePK().Update(); err != nil {
-		return errors.Wrap(err, "failed to update resource status to processing")
-	}
-	return nil
-}
-
-func (s *Worker) Close() {
-	log.Info("closing Worker")
-	s.cancel()
-	s.wg.Wait()
-	log.Info("Worker closed")
-}
-
-func (s *Worker) jobCancelContext(inCtx context.Context, db *pg.DB, j job) (ctx context.Context, cancel context.CancelFunc) {
-	ctx, cancel = context.WithCancel(inCtx)
-	ticker := time.NewTicker(5 * time.Second)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				res := &Resource{ID: j.id}
-				err := db.Model(res).
-					Context(inCtx).
-					WherePK().
-					Where("status = ?", j.status).
-					Select()
-				if err != nil && !errors.Is(err, pg.ErrNoRows) {
-					log.WithError(err).WithField("id", j.id).Error("check status failed")
-				} else if err != nil && errors.Is(err, pg.ErrNoRows) {
-					log.WithField("id", j.id).WithField("status", j.status.String()).Info("status changed, job cancelled")
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	return
-}
-
-func (s *Worker) processJob(ctx context.Context, db *pg.DB, j job) (err error) {
-	ctx, cancel := s.jobCancelContext(ctx, db, j)
-	defer cancel()
-	opLog, err := WorkerLogStart(ctx, db, j.id, j.status)
-	if err != nil {
-		log.WithError(err).WithField("resource_id", j.id).Warn("failed to create worker log")
-	}
-	if opLog != nil {
-		defer func() {
-			lerr := WorkerLogFinish(ctx, db, opLog.LogID, err)
-			if lerr != nil {
-				log.WithError(lerr).WithField("log_id", opLog.LogID).Warn("failed to finish worker log")
-			}
-		}()
-	}
-	switch j.status {
-	case StatusStoring:
-		log.WithField("id", j.id).Info("storing started")
-		if err = s.handleStore(ctx, db, j.id); err != nil {
-			log.WithError(err).WithField("id", j.id).Error("store failed")
-			s.handleError(ctx, j.id, err, StatusStoreError)
-			return
-		}
-		log.WithField("id", j.id).Info("stored successfully")
-		if s.nats != nil {
-			nc := s.nats.Get()
-			if nc != nil {
-				b, _ := json.Marshal(map[string]string{"resource_id": j.id})
-				if pubErr := nc.Publish("resource.vaulted", b); pubErr != nil {
-					log.WithError(pubErr).WithField("id", j.id).Error("failed to publish nats message")
-				}
-			}
-		}
-	case StatusDeleting:
-		log.WithField("id", j.id).Info("deleting started")
-		if err = s.handleDelete(ctx, db, j.id); err != nil {
-			log.WithError(err).WithField("id", j.id).Error("delete failed")
-			s.handleError(ctx, j.id, err, StatusDeleteError)
-			return
-		}
-		log.WithField("id", j.id).Info("deleted successfully")
-	default:
-		return fmt.Errorf("unexpected job status: %s", j.status)
-	}
-	return
-}
-
-func (s *Worker) workerLoop() {
+// claimLoop is the long-running worker goroutine. It keeps trying to
+// claim a resource; when it gets one, it processes it to completion;
+// when the queue is empty it sleeps claimIdleSleep before trying again.
+// Each worker goroutine runs independently — the only coordination with
+// other goroutines (inside this pod or across pods) is the atomic CAS in
+// tryClaim, which is safe because it is a single UPDATE ... RETURNING in
+// the database.
+func (s *Worker) claimLoop(workerID string) {
 	defer s.wg.Done()
 	db := s.pg.Get()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case j := <-s.jobs:
-			err := s.processJob(s.ctx, db, j)
-			if err != nil {
-				log.WithError(err).Error("process job failed")
+		default:
+		}
+		res, err := s.tryClaim(s.ctx, db, workerID)
+		if err != nil {
+			log.WithError(err).WithField("worker", workerID).Warn("claim failed")
+			// back off a bit on transient DB errors
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(claimIdleSleep):
 			}
-			s.pending.Delete(j.id)
+			continue
+		}
+		if res == nil {
+			// Nothing to do. Sleep a little before polling again.
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(claimIdleSleep):
+			}
+			continue
+		}
+		s.processClaimed(s.ctx, db, res, workerID)
+	}
+}
+
+// tryClaim atomically picks one eligible resource and acquires a lease on
+// it. The combination of SELECT ... FOR UPDATE SKIP LOCKED (for picking a
+// candidate without stepping on other workers) and UPDATE ... WHERE
+// (claim_expires_at IS NULL OR claim_expires_at < now()) (for the lease
+// CAS guarantee) makes the operation safe across any number of workers
+// and pods: at most one worker succeeds in claiming any given row per call.
+//
+// Eligibility rules (mirroring the old process() time constraints but
+// expressed on top of lease):
+//   - queued_for_storing / queued_for_deletion: always eligible.
+//   - storing / deleting with expired (or null) lease: reclaim after crash.
+//   - store_error / delete_error: eligible after storeErrorBackoff has
+//     elapsed since the last status change (updated_at).
+//
+// The status is flipped to the corresponding processing status in the
+// same UPDATE, so there is no intermediate "just claimed, not yet started"
+// state visible to other workers.
+func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string) (*Resource, error) {
+	var res Resource
+	// The subquery picks one eligible row, and the outer UPDATE takes the
+	// lease and flips status. RETURNING gives us the full updated row.
+	subquery := fmt.Sprintf(`
+		SELECT resource_id FROM resource
+		WHERE (claim_expires_at IS NULL OR claim_expires_at < now())
+		  AND (
+		    status IN (%d, %d)
+		    OR (status IN (%d, %d))
+		    OR (status IN (%d, %d) AND now() - updated_at > interval '%d seconds')
+		  )
+		  %s
+		ORDER BY
+		  CASE WHEN status IN (%d, %d) THEN 0 ELSE 1 END,
+		  updated_at ASC
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`,
+		StatusQueuedForStoring, StatusQueuedForDeletion,
+		StatusStoring, StatusDeleting,
+		StatusStoreError, StatusDeleteError, int(storeErrorBackoff.Seconds()),
+		s.debugResourceIDClause(),
+		StatusQueuedForStoring, StatusQueuedForDeletion,
+	)
+
+	stmt := fmt.Sprintf(`
+		UPDATE resource
+		SET claim_expires_at = now() + interval '%d seconds',
+		    claimed_by = ?,
+		    status = CASE
+		      WHEN status IN (%d, %d, %d) THEN %d
+		      WHEN status IN (%d, %d, %d) THEN %d
+		      ELSE status
+		    END,
+		    error = NULL,
+		    updated_at = now()
+		WHERE resource_id = (%s)
+		RETURNING *
+	`,
+		int(leaseDuration.Seconds()),
+		StatusQueuedForStoring, StatusStoring, StatusStoreError, StatusStoring,
+		StatusQueuedForDeletion, StatusDeleting, StatusDeleteError, StatusDeleting,
+		subquery,
+	)
+
+	_, err := db.QueryContext(ctx, &res, stmt, workerID)
+	if err != nil {
+		if errors.Is(err, pg.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, errors.Wrap(err, "failed to claim resource")
+	}
+	if res.ID == "" {
+		return nil, nil
+	}
+	log.WithFields(log.Fields{
+		"resource_id": res.ID,
+		"status":      res.Status.String(),
+		"worker":      workerID,
+	}).Info("claimed resource")
+	return &res, nil
+}
+
+// debugResourceIDClause returns an extra WHERE clause that narrows the
+// claim subquery to a specific resource ID when debug mode is active.
+// Empty string in normal (production) operation.
+func (s *Worker) debugResourceIDClause() string {
+	if s.resourceID == "" {
+		return ""
+	}
+	// Safe: resourceID comes from a CLI flag, not user input.
+	return fmt.Sprintf("AND resource_id = '%s'", s.resourceID)
+}
+
+// processClaimed is invoked once the worker has successfully acquired a
+// lease on a resource. It starts the lease heartbeat goroutine, dispatches
+// to the correct handler based on the resource's (already flipped)
+// processing status, and finally releases the lease.
+func (s *Worker) processClaimed(parentCtx context.Context, db *pg.DB, res *Resource, workerID string) {
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	// Start lease heartbeat. On lease loss (e.g. another worker took over
+	// because our DB updates stalled, or someone cleared the lease
+	// externally, or our status changed out from under us) the heartbeat
+	// cancels ctx so the handler returns promptly.
+	stopHeartbeat := s.startLeaseHeartbeat(ctx, cancel, db, res.ID, workerID, res.Status)
+	defer stopHeartbeat()
+
+	opLog, logErr := WorkerLogStart(ctx, db, res.ID, res.Status)
+	if logErr != nil {
+		log.WithError(logErr).WithField("resource_id", res.ID).Warn("failed to create worker log")
+	}
+
+	var handlerErr error
+	switch res.Status {
+	case StatusStoring:
+		log.WithField("id", res.ID).Info("storing started")
+		handlerErr = s.handleStore(ctx, db, res.ID)
+		if handlerErr != nil {
+			log.WithError(handlerErr).WithField("id", res.ID).Error("store failed")
+			s.handleError(res.ID, handlerErr, StatusStoreError, workerID)
+		} else {
+			log.WithField("id", res.ID).Info("stored successfully")
+			if s.nats != nil {
+				if nc := s.nats.Get(); nc != nil {
+					b, _ := json.Marshal(map[string]string{"resource_id": res.ID})
+					if pubErr := nc.Publish("resource.vaulted", b); pubErr != nil {
+						log.WithError(pubErr).WithField("id", res.ID).Error("failed to publish nats message")
+					}
+				}
+			}
+			// Successful store reached StatusStored in handleStore; clear
+			// the lease for tidiness (status=stored rows never get
+			// re-claimed anyway, but leaving a stale claim_expires_at
+			// around is confusing when debugging).
+			s.releaseLease(db, res.ID, workerID)
+		}
+	case StatusDeleting:
+		log.WithField("id", res.ID).Info("deleting started")
+		handlerErr = s.handleDelete(ctx, db, res.ID)
+		if handlerErr != nil {
+			log.WithError(handlerErr).WithField("id", res.ID).Error("delete failed")
+			s.handleError(res.ID, handlerErr, StatusDeleteError, workerID)
+		} else {
+			log.WithField("id", res.ID).Info("deleted successfully")
+			// handleDelete removes the resource row entirely on success,
+			// so there's nothing left to release.
+		}
+	default:
+		log.WithField("status", res.Status.String()).Error("unexpected processing status on claimed resource")
+		handlerErr = fmt.Errorf("unexpected status: %s", res.Status)
+		s.releaseLease(db, res.ID, workerID)
+	}
+
+	if opLog != nil {
+		if fErr := WorkerLogFinish(ctx, db, opLog.LogID, handlerErr); fErr != nil {
+			log.WithError(fErr).WithField("log_id", opLog.LogID).Warn("failed to finish worker log")
 		}
 	}
 }
 
-func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err error) {
-	// Keep updated_at fresh from the very start to prevent other workers
-	// from re-claiming this resource during slow initial operations
-	// (ListResourceContent, generateFileHash).
-	stopFlush := runPeriodicFlush(ctx, func() {
-		if _, err := db.Model(&Resource{ID: id}).
-			Context(ctx).
-			Set("updated_at = now()").
-			Where("resource_id = ?", id).
-			Update(); err != nil {
-			log.WithError(err).WithField("resource_id", id).Warn("store heartbeat failed")
+// startLeaseHeartbeat launches a goroutine that refreshes the lease
+// every leaseHeartbeat. If the UPDATE touches 0 rows — meaning we no
+// longer own the lease for any reason (lease expired and someone else
+// reclaimed it, status was flipped externally, the row was deleted) —
+// the heartbeat cancels the job context so the handler aborts promptly.
+//
+// Returns a function that stops the heartbeat (call in a defer).
+func (s *Worker) startLeaseHeartbeat(ctx context.Context, cancelJob context.CancelFunc, db *pg.DB, resourceID, workerID string, processingStatus Status) context.CancelFunc {
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(leaseHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			// Use a short independent timeout — we don't want the heartbeat
+			// itself to hang on a slow DB and starve the cancellation path.
+			uctx, uc := context.WithTimeout(context.Background(), 5*time.Second)
+			result, err := db.Model((*Resource)(nil)).
+				Context(uctx).
+				Set("claim_expires_at = now() + interval '? seconds'", int(leaseDuration.Seconds())).
+				Where("resource_id = ?", resourceID).
+				Where("claimed_by = ?", workerID).
+				Where("status = ?", processingStatus).
+				Update()
+			uc()
+			if err != nil {
+				log.WithError(err).
+					WithField("resource_id", resourceID).
+					WithField("worker", workerID).
+					Warn("lease heartbeat db error; will retry next tick")
+				continue
+			}
+			if result.RowsAffected() == 0 {
+				log.WithFields(log.Fields{
+					"resource_id":       resourceID,
+					"worker":            workerID,
+					"processing_status": processingStatus.String(),
+				}).Warn("lease lost (row gone, reclaimed by another worker, or status changed); cancelling job")
+				cancelJob()
+				return
+			}
 		}
-	})
-	defer stopFlush()
+	}()
+	return hbCancel
+}
+
+// releaseLease clears the lease fields for a resource, but only if we
+// actually hold it. Used on successful completion and on graceful
+// shutdown. Never fails the caller — a stale lease will expire naturally.
+func (s *Worker) releaseLease(db *pg.DB, resourceID, workerID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := db.Model((*Resource)(nil)).
+		Context(ctx).
+		Set("claim_expires_at = NULL").
+		Set("claimed_by = NULL").
+		Where("resource_id = ?", resourceID).
+		Where("claimed_by = ?", workerID).
+		Update()
+	if err != nil {
+		log.WithError(err).
+			WithField("resource_id", resourceID).
+			WithField("worker", workerID).
+			Warn("failed to release lease (will expire naturally)")
+	}
+}
+
+// Close cancels the worker context, waits for all claim loops to finish,
+// then makes a best-effort attempt to release any leases this pod still
+// holds. Releasing leases on shutdown means a rolling deploy hands work
+// back to the remaining pods immediately instead of making them wait for
+// the 2-minute lease to expire before reclaiming.
+func (s *Worker) Close() {
+	log.Info("closing Worker")
+	s.cancel()
+	s.wg.Wait()
+	// Best-effort: release anything still pinned to this pod. Use a
+	// separate short-lived context since s.ctx is already cancelled.
+	db := s.pg.Get()
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := db.Model((*Resource)(nil)).
+			Context(ctx).
+			Set("claim_expires_at = NULL").
+			Set("claimed_by = NULL").
+			Where("claimed_by LIKE ?", s.workerBase+"#%").
+			Update()
+		if err != nil {
+			log.WithError(err).Warn("shutdown lease release failed (leases will expire naturally)")
+		} else if n := result.RowsAffected(); n > 0 {
+			log.WithField("count", n).Info("released leases held by this pod on shutdown")
+		}
+	}
+	log.Info("Worker closed")
+}
+
+func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err error) {
+	// Note: the lease heartbeat that keeps this resource claimed by the
+	// current worker is started and stopped by processClaimed — there is
+	// no heartbeat logic inside handleStore itself. If the lease is lost
+	// for any reason, the heartbeat goroutine cancels ctx and every DB
+	// operation below returns promptly with context.Canceled.
 
 	listArgs := &ListResourceContentArgs{
 		Limit:  100,
@@ -496,16 +574,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	if s.bucket == "" {
 		return errors.New("s3 bucket is not configured")
 	}
-	stopFlush := runPeriodicFlush(ctx, func() {
-		if _, err := db.Model(&Resource{ID: id}).
-			Context(ctx).
-			Set("updated_at = now()").
-			Where("resource_id = ?", id).
-			Update(); err != nil {
-			log.WithError(err).WithField("resource_id", id).Warn("delete heartbeat failed")
-		}
-	})
-	defer stopFlush()
+	// Lease heartbeat is managed by processClaimed, same as handleStore.
 	// 1) Collect all files linked to this resource
 	var rfs []ResourceFile
 	if err := db.Model(&rfs).Context(ctx).Where("resource_id = ?", id).Select(); err != nil && !errors.Is(err, pg.ErrNoRows) {
@@ -577,31 +646,39 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	return nil
 }
 
-func (s *Worker) handleError(_ context.Context, id string, err error, status Status) {
+// handleError records a failure on the resource and releases our lease.
+// Releasing the lease is important: the next retry attempt (after the
+// store_error backoff) should see claim_expires_at IS NULL so tryClaim
+// can pick the row up cleanly without relying on the deadline having
+// passed. The WHERE on claimed_by + processing status makes the update
+// safe against concurrent lease transfer.
+func (s *Worker) handleError(id string, err error, errorStatus Status, workerID string) {
 	db := s.pg.Get()
 	errMsg := err.Error()
 	// Determine which processing status we expect the resource to still be in.
 	// Only overwrite if the resource is still in that processing state —
 	// otherwise an external status change (e.g. QueuedForDeletion) would be lost.
 	var expectedStatus Status
-	switch status {
+	switch errorStatus {
 	case StatusStoreError:
 		expectedStatus = StatusStoring
 	case StatusDeleteError:
 		expectedStatus = StatusDeleting
 	default:
-		expectedStatus = status
+		expectedStatus = errorStatus
 	}
 	// Use a fresh context with timeout — the job context may already be cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	res := &Resource{ID: id, Error: &errMsg, Status: status}
-	result, upErr := db.Model(res).
+	result, upErr := db.Model((*Resource)(nil)).
 		Context(ctx).
-		Column("status").
-		Column("error").
+		Set("status = ?", errorStatus).
+		Set("error = ?", errMsg).
+		Set("claim_expires_at = NULL").
+		Set("claimed_by = NULL").
 		Where("resource_id = ?", id).
 		Where("status = ?", expectedStatus).
+		Where("claimed_by = ?", workerID).
 		Update()
 	if upErr != nil {
 		log.WithError(upErr).Error("update error status failed")
@@ -609,13 +686,16 @@ func (s *Worker) handleError(_ context.Context, id string, err error, status Sta
 		log.WithFields(log.Fields{
 			"id":              id,
 			"expected_status": expectedStatus.String(),
-		}).Warn("skipped error status update: resource status changed externally")
+			"worker":          workerID,
+		}).Warn("skipped error status update: resource status/lease changed externally")
 	}
 }
 
 // runPeriodicFlush calls fn every 10 seconds until the returned cancel
-// function is called. It is used to keep resource.updated_at fresh so that
-// other workers do not re-claim the same job.
+// function is called. It is used by storeFile to flush the current
+// stored_size counters on file and resource rows to the DB while a
+// multipart upload is in progress, so the UI can show progress.
+// Lease heartbeat is handled separately by startLeaseHeartbeat.
 func runPeriodicFlush(ctx context.Context, fn func()) context.CancelFunc {
 	fctx, cancel := context.WithCancel(ctx)
 	go func() {

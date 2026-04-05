@@ -63,7 +63,7 @@ type ErrorResponse struct {
 }
 
 // Resource represents a stored object composed from one or more files.
-// DB mapping is aligned with migrations/1_init.*
+// DB mapping is aligned with migrations/1_init.* and 8_resource_claim.*
 type Resource struct {
 	// go-pg table name
 	tableName struct{} `pg:"resource"`
@@ -75,6 +75,14 @@ type Resource struct {
 	Error      *string   `json:"error,omitempty" pg:"error"`
 	CreatedAt  time.Time `json:"created_at" pg:"created_at,notnull,default:now()"`
 	UpdatedAt  time.Time `json:"updated_at" pg:"updated_at,notnull,default:now()"`
+
+	// Lease columns (migration 8). A non-null claim_expires_at in the future
+	// means the row is owned by the worker in claimed_by for that duration.
+	// Heartbeat refreshes the deadline; on crash or shutdown the lease
+	// naturally expires and another worker can reclaim the row. This replaces
+	// the old "row updated_at is stale" heuristic for cross-pod coordination.
+	ClaimExpiresAt *time.Time `json:"claim_expires_at,omitempty" pg:"claim_expires_at"`
+	ClaimedBy      *string    `json:"claimed_by,omitempty" pg:"claimed_by"`
 
 	// Relations
 	// All resource<->file links for this resource. Use with Relation("ResourceFiles") or
