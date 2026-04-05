@@ -91,12 +91,17 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NAT
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	w := &Worker{
-		ctx:        ctx,
-		cancel:     cancel,
-		pg:         pgc,
-		s3:         s3,
-		nwrks:      c.Int(workerCountFlag),
-		jobs:       make(chan job, 1024),
+		ctx:    ctx,
+		cancel: cancel,
+		pg:     pgc,
+		s3:     s3,
+		nwrks:  c.Int(workerCountFlag),
+		// Unbuffered channel: process() blocks on dispatch until a worker
+		// is actually ready to run handleStore. This keeps the window
+		// between status=storing (set in processResource) and the start
+		// of runPeriodicFlush (inside handleStore) minimal, preventing
+		// cross-pod re-claims caused by stale updated_at during queue wait.
+		jobs:       make(chan job),
 		api:        api,
 		bucket:     c.String(awsBucketFlag),
 		concur:     c.Int(awsUploadConcurrencyFlag),
@@ -162,14 +167,22 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		if s.resourceID != "" {
 			q = q.Where("resource_id = ?", s.resourceID)
 		} else {
-			// Apply normal time constraints only when not debugging specific resource
+			// Apply normal time constraints only when not debugging specific resource.
+			//
+			// The reclaim interval for in-progress jobs (storing/deleting) must be
+			// larger than the longest pause between heartbeats from runPeriodicFlush
+			// (10s tick). 1 minute was too tight and caused cross-pod double-claim
+			// races when a job spent time in the jobs channel before handleStore
+			// actually started ticking the heartbeat. 15 minutes gives ample slack
+			// for slow metadata ops (generateFileHash, ListResourceContent) on huge
+			// files while still recovering from a truly dead pod.
 			q = q.WhereGroup(func(q *pg.Query) (*pg.Query, error) {
 				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
 					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
 						Where("now() - updated_at > interval '30 minutes'"), nil
 				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
 					return q.Where("status NOT IN (?, ?)", StatusStoreError, StatusDeleteError).
-						Where("now() - updated_at > interval '1 minute'"), nil
+						Where("now() - updated_at > interval '15 minutes'"), nil
 				}), nil
 			})
 		}
@@ -423,6 +436,9 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 				if err != nil {
 					return errors.Wrap(err, "failed to store file")
 				}
+				if f.Status != StatusStored {
+					return errors.Errorf("storeFile returned file in status %q (expected stored), hash=%s, path=%s", f.Status, f.Hash, item.PathStr)
+				}
 				totalStored += item.Size
 
 				if _, err := db.Model(&Resource{ID: id}).
@@ -628,8 +644,32 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, errors.Wrap(err, "failed to check for existing file")
 	}
 	if err == nil {
-		// Found a suitable file that's already stored
-		return &existing, nil
+		// Verify the S3 object actually exists before trusting DB status.
+		// Guards against orphaned "stored" rows left behind by prior race
+		// conditions, external S3 cleanup, or multipart uploads that were
+		// marked complete in DB but never finalized in S3.
+		s3Cl := s.s3.Get()
+		_, headErr := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(existing.Hash),
+		})
+		if headErr == nil {
+			return &existing, nil
+		}
+		log.WithError(headErr).WithFields(log.Fields{
+			"hash": existing.Hash,
+			"path": item.PathStr,
+		}).Warn("dedup candidate marked stored but missing in S3, forcing re-upload")
+		// Reset the stale row so the regular upload path below re-uploads it
+		// when the same content hash is recomputed via generateFileHash.
+		if _, err := db.Model(&existing).Context(ctx).
+			Set("status = ?", StatusStoring).
+			Set("stored_size = 0").
+			Set("upload_id = ''").
+			Set("updated_at = now()").
+			WherePK().Update(); err != nil {
+			return nil, errors.Wrap(err, "failed to reset stale stored file row from dedup")
+		}
 	}
 	// No existing stored file found by path+size, proceed with exporting and storing by content hash
 	ei, err := s.api.ExportResourceContent(ctx, cla, id, item.ID)
@@ -704,15 +744,37 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
 		return nil, errors.Wrap(err, "failed to select file by hash")
 	}
-	if err == nil && (f.Status == StatusStored || (f.UpdatedAt.Add(10*time.Second).After(time.Now()) && f.UploadID == "")) {
-		return f, nil
+	s3Cl := s.s3.Get()
+	// Only short-circuit if the file is *fully* stored AND the S3 object
+	// actually exists. Returning "fresh but in-progress" rows here (the old
+	// `updated_at < 10s && upload_id == ""` branch) was unsafe: a concurrent
+	// worker may have just inserted the row but not yet started the upload,
+	// in which case we would declare the file stored while nothing was in S3.
+	if err == nil && f.Status == StatusStored {
+		_, headErr := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(hash),
+		})
+		if headErr == nil {
+			return f, nil
+		}
+		log.WithError(headErr).WithField("hash", hash).
+			Warn("file marked stored but missing in S3, re-uploading")
+		// Fall through into the re-upload path below. Reset the row so the
+		// multipart upload logic starts from scratch.
+		f.Status = StatusStoring
+		f.StoredSize = 0
+		f.UploadID = ""
+		if _, err := db.Model(f).Context(ctx).
+			Column("status", "stored_size", "upload_id").
+			WherePK().Update(); err != nil {
+			return nil, errors.Wrap(err, "failed to reset stale stored file row")
+		}
 	}
 	_, err = db.Model(f).Context(ctx).Insert()
 	if err != nil && !IsPGDuplicateKey(err) {
 		return nil, errors.Wrap(err, "failed to insert file")
 	}
-
-	s3Cl := s.s3.Get()
 
 	if f.UploadID != "" && f.PartSize != partSize {
 		log.WithFields(log.Fields{
