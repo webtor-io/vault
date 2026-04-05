@@ -865,7 +865,22 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		log.WithError(err).Error("initial flush progress failed")
 	}
 
-	dctx, dcancel := context.WithTimeout(ctx, 20*time.Minute)
+	// Download timeout must accommodate the entire remaining file. 20 minutes
+	// was fixed regardless of size, which made it impossible to upload files
+	// larger than ~6 GB even at a healthy 5 MB/s source rate, and guaranteed
+	// failure for 15+ GB content. Compute dynamically from remaining bytes
+	// assuming a conservative 2 MB/s effective throughput (torrent sources
+	// are noisy), with a floor of 20 minutes for small files and a ceiling
+	// of 6 hours to still catch genuinely stuck streams.
+	remaining := f.TotalSize - stored
+	dlTimeout := time.Duration(remaining/(2*1024*1024)) * time.Second
+	if dlTimeout < 20*time.Minute {
+		dlTimeout = 20 * time.Minute
+	}
+	if dlTimeout > 6*time.Hour {
+		dlTimeout = 6 * time.Hour
+	}
+	dctx, dcancel := context.WithTimeout(ctx, dlTimeout)
 	defer dcancel()
 	r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
 	if err != nil {
