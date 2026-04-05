@@ -167,22 +167,33 @@ func (s *Worker) process(ctx context.Context, db *pg.DB) error {
 		if s.resourceID != "" {
 			q = q.Where("resource_id = ?", s.resourceID)
 		} else {
-			// Apply normal time constraints only when not debugging specific resource.
+			// Apply time constraints per status class:
 			//
-			// The reclaim interval for in-progress jobs (storing/deleting) must be
-			// larger than the longest pause between heartbeats from runPeriodicFlush
-			// (10s tick). 1 minute was too tight and caused cross-pod double-claim
-			// races when a job spent time in the jobs channel before handleStore
-			// actually started ticking the heartbeat. 15 minutes gives ample slack
-			// for slow metadata ops (generateFileHash, ListResourceContent) on huge
-			// files while still recovering from a truly dead pod.
+			// - queued_for_storing / queued_for_deletion: NO time constraint.
+			//   These are brand-new jobs submitted via PUT/DELETE /resource.
+			//   They must be picked up on the next tick (≤5s) so users don't
+			//   wait for a reclaim window before processing starts.
+			//
+			// - storing / deleting: reclaim only after 15 minutes of no
+			//   updated_at change. The runPeriodicFlush heartbeat in
+			//   handleStore/handleDelete ticks every 10s, so a live worker
+			//   keeps the row fresh. 15 minutes gives ample slack for slow
+			//   metadata ops (generateFileHash, ListResourceContent) on huge
+			//   files while still recovering from a truly dead pod. Raised
+			//   from the original 1 minute to fix cross-pod double-claim
+			//   races when a job spent time in the jobs channel before
+			//   handleStore actually started ticking the heartbeat.
+			//
+			// - store_error / delete_error: retry after 30 minutes of backoff.
 			q = q.WhereGroup(func(q *pg.Query) (*pg.Query, error) {
 				return q.WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
+					return q.Where("status IN (?, ?)", StatusQueuedForStoring, StatusQueuedForDeletion), nil
+				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
+					return q.Where("status IN (?, ?)", StatusStoring, StatusDeleting).
+						Where("now() - updated_at > interval '15 minutes'"), nil
+				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
 					return q.Where("status IN (?, ?)", StatusStoreError, StatusDeleteError).
 						Where("now() - updated_at > interval '30 minutes'"), nil
-				}).WhereOrGroup(func(q *pg.Query) (*pg.Query, error) {
-					return q.Where("status NOT IN (?, ?)", StatusStoreError, StatusDeleteError).
-						Where("now() - updated_at > interval '15 minutes'"), nil
 				}), nil
 			})
 		}
