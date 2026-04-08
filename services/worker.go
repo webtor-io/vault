@@ -956,30 +956,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		log.WithError(err).Error("initial flush progress failed")
 	}
 
-	// Download timeout must accommodate the entire remaining file. 20 minutes
-	// was fixed regardless of size, which made it impossible to upload files
-	// larger than ~6 GB even at a healthy 5 MB/s source rate, and guaranteed
-	// failure for 15+ GB content. Compute dynamically from remaining bytes
-	// assuming a conservative 2 MB/s effective throughput (torrent sources
-	// are noisy), with a floor of 20 minutes for small files and a ceiling
-	// of 6 hours to still catch genuinely stuck streams.
-	remaining := f.TotalSize - stored
-	dlTimeout := time.Duration(remaining/(2*1024*1024)) * time.Second
-	if dlTimeout < 20*time.Minute {
-		dlTimeout = 20 * time.Minute
-	}
-	if dlTimeout > 6*time.Hour {
-		dlTimeout = 6 * time.Hour
-	}
-	dctx, dcancel := context.WithTimeout(ctx, dlTimeout)
-	defer dcancel()
-	r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to download file content with range, url=%s, start=%d", u, stored)
-	}
-	defer func(r io.ReadCloser) {
-		_ = r.Close()
-	}(r)
+	const maxDownloadRetries = 3
 
 	type partJob struct {
 		partNumber int64
@@ -1038,6 +1015,33 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}()
 	}
 
+	// openDownload creates a new download stream from the current stored offset
+	// with a dynamic timeout based on remaining bytes.
+	openDownload := func() (io.ReadCloser, context.CancelFunc, error) {
+		remaining := f.TotalSize - stored
+		dlTimeout := time.Duration(remaining/(2*1024*1024)) * time.Second
+		if dlTimeout < 20*time.Minute {
+			dlTimeout = 20 * time.Minute
+		}
+		if dlTimeout > 6*time.Hour {
+			dlTimeout = 6 * time.Hour
+		}
+		dctx, dcancel := context.WithTimeout(ctx, dlTimeout)
+		r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
+		if err != nil {
+			dcancel()
+			return nil, nil, errors.Wrapf(err, "failed to download file content with range, url=%s, start=%d", u, stored)
+		}
+		return r, dcancel, nil
+	}
+
+	r, dcancel, err := openDownload()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { dcancel() }()
+	defer func() { _ = r.Close() }()
+
 	for stored < f.TotalSize {
 		select {
 		case <-ctx.Done():
@@ -1066,10 +1070,34 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}).Info("reading part")
 
 		buf := make([]byte, currentPartSize)
-		_, err := io.ReadFull(r, buf)
-		if err != nil {
-			setUploadErr(errors.Wrap(err, "failed to read part data from download stream"))
-			break
+		_, readErr := io.ReadFull(r, buf)
+		if readErr != nil {
+			// Connection dropped or timeout — retry download from current offset.
+			retried := false
+			for attempt := 1; attempt <= maxDownloadRetries; attempt++ {
+				log.WithFields(log.Fields{
+					"resource_id": id,
+					"stored":      stored,
+					"attempt":     attempt,
+				}).WithError(readErr).Warn("download stream interrupted, reconnecting")
+				_ = r.Close()
+				dcancel()
+				time.Sleep(time.Duration(attempt) * 5 * time.Second)
+				r, dcancel, err = openDownload()
+				if err != nil {
+					readErr = err
+					continue
+				}
+				_, readErr = io.ReadFull(r, buf)
+				if readErr == nil {
+					retried = true
+					break
+				}
+			}
+			if !retried {
+				setUploadErr(errors.Wrap(readErr, "failed to read part data from download stream"))
+				break
+			}
 		}
 
 		jobs <- partJob{
