@@ -117,10 +117,7 @@ const docTemplatevault = `{
         },
         "/webseed/{id}/{path}": {
             "get": {
-                "description": "Proxies stored files from S3 with Range support. Returns 404 if resource is not fully stored or file not found.",
-                "produces": [
-                    "application/octet-stream"
-                ],
+                "description": "Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.",
                 "tags": [
                     "webseed"
                 ],
@@ -142,11 +139,8 @@ const docTemplatevault = `{
                     }
                 ],
                 "responses": {
-                    "200": {
-                        "description": "OK"
-                    },
-                    "206": {
-                        "description": "Partial Content"
+                    "302": {
+                        "description": "Found"
                     },
                     "404": {
                         "description": "Not Found",
@@ -163,10 +157,7 @@ const docTemplatevault = `{
                 }
             },
             "head": {
-                "description": "Proxies stored files from S3 with Range support. Returns 404 if resource is not fully stored or file not found.",
-                "produces": [
-                    "application/octet-stream"
-                ],
+                "description": "Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.",
                 "tags": [
                     "webseed"
                 ],
@@ -188,11 +179,8 @@ const docTemplatevault = `{
                     }
                 ],
                 "responses": {
-                    "200": {
-                        "description": "OK"
-                    },
-                    "206": {
-                        "description": "Partial Content"
+                    "302": {
+                        "description": "Found"
                     },
                     "404": {
                         "description": "Not Found",
@@ -222,6 +210,13 @@ const docTemplatevault = `{
         "services.Resource": {
             "type": "object",
             "properties": {
+                "claim_expires_at": {
+                    "description": "Lease columns (migration 8). A non-null claim_expires_at in the future\nmeans the row is owned by the worker in claimed_by for that duration.\nHeartbeat refreshes the deadline; on crash or shutdown the lease\nnaturally expires and another worker can reclaim the row. This replaces\nthe old \"row updated_at is stale\" heuristic for cross-pod coordination.",
+                    "type": "string"
+                },
+                "claimed_by": {
+                    "type": "string"
+                },
                 "created_at": {
                     "type": "string"
                 },
@@ -247,6 +242,7 @@ const docTemplatevault = `{
         },
         "services.Status": {
             "type": "integer",
+            "format": "int32",
             "enum": [
                 0,
                 1,

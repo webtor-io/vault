@@ -473,6 +473,14 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// no heartbeat logic inside handleStore itself. If the lease is lost
 	// for any reason, the heartbeat goroutine cancels ctx and every DB
 	// operation below returns promptly with context.Canceled.
+	//
+	// Orphan-safety invariant: `resource_file` is never wiped up-front.
+	// Old links are pruned only AFTER the new listing has been fully
+	// processed (diff-based pruning at the end). This guarantees that at
+	// any intermediate point — including a crash, a lease loss, or an
+	// incoming queued_for_deletion — `resource_file` reflects a valid
+	// superset of the files that are currently in S3, so `handleDelete`
+	// can still find and clean them up.
 
 	listArgs := &ListResourceContentArgs{
 		Limit:  100,
@@ -482,7 +490,9 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		Role: "vault",
 	}
 
-	// Reset resource counters before (re)storing
+	// Reset resource counters before (re)storing. Only the numeric counters
+	// are reset here — `resource_file` rows are preserved so that a partial
+	// re-store cannot drop links to files that are still in S3.
 	if _, err := db.Model(&Resource{ID: id}).
 		Context(ctx).
 		Set("total_size = 0").
@@ -494,13 +504,11 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		return errors.Wrap(err, "failed to reset resource counters")
 	}
 
-	// Clean up old resource_file links to avoid orphans on re-store
-	if _, err := db.Model((*ResourceFile)(nil)).
-		Context(ctx).
-		Where("resource_id = ?", id).
-		Delete(); err != nil {
-		return errors.Wrap(err, "failed to clean up old resource_file links")
-	}
+	// Track (file_hash, path) pairs produced by this run so stale links
+	// can be diff-pruned at the end. Using a map of maps guards against
+	// the same path appearing with a different hash (content change).
+	type rfKey struct{ Hash, Path string }
+	expected := make(map[rfKey]struct{})
 
 	var totalSize, totalStored int64
 	// Paginate through results to find the file at the specified index
@@ -525,10 +533,37 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 				if err != nil {
 					return errors.Wrap(err, "failed to store file")
 				}
-				if f.Status != StatusStored {
-					return errors.Errorf("storeFile returned file in status %q (expected stored), hash=%s, path=%s", f.Status, f.Hash, item.PathStr)
-				}
 				totalStored += item.Size
+
+				// Atomically finalize the file to `stored` and link it to
+				// the resource. Wrapping both statements in one transaction
+				// closes the window where a file is in S3 but has no
+				// resource_file row (which would leak it on deletion).
+				// Works for all storeFile return paths: for dedup/hash
+				// hits the UPDATE is a no-op.
+				if err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
+					if _, err := tx.Model((*File)(nil)).
+						Set("status = ?", StatusStored).
+						Set("stored_size = ?", f.TotalSize).
+						Set("upload_id = ''").
+						Set("updated_at = now()").
+						Where("hash = ?", f.Hash).
+						Update(); err != nil {
+						return errors.Wrap(err, "failed to finalize file status")
+					}
+					rf := &ResourceFile{
+						ResourceID: id,
+						FileHash:   f.Hash,
+						Path:       item.PathStr,
+					}
+					if _, err := tx.Model(rf).OnConflict("DO NOTHING").Insert(); err != nil {
+						return errors.Wrap(err, "failed to insert resource_file")
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+				expected[rfKey{Hash: f.Hash, Path: item.PathStr}] = struct{}{}
 
 				if _, err := db.Model(&Resource{ID: id}).
 					Context(ctx).
@@ -537,15 +572,6 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 					Where("resource_id = ?", id).
 					Update(); err != nil {
 					return errors.Wrap(err, "failed to update resource stored_size")
-				}
-				rf := &ResourceFile{
-					ResourceID: id,
-					FileHash:   f.Hash,
-					Path:       item.PathStr,
-				}
-				_, err = db.Model(rf).Insert()
-				if err != nil && !IsPGDuplicateKey(err) {
-					return errors.Wrap(err, "failed to insert resource_file")
 				}
 			}
 		}
@@ -558,6 +584,32 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		listArgs.Offset += listArgs.Limit
 	}
 
+	// All new files are stored and linked. Now diff-prune: drop any
+	// resource_file rows not in `expected`, and GC orphan file rows/S3
+	// objects whose last reference we just removed. Done only on the
+	// success path — partial failures preserve the old link set so that
+	// a subsequent retry or deletion can clean up safely.
+	var existing []ResourceFile
+	if err := db.Model(&existing).Context(ctx).Where("resource_id = ?", id).Select(); err != nil {
+		return errors.Wrap(err, "failed to list existing resource_file for pruning")
+	}
+	for _, rf := range existing {
+		if _, ok := expected[rfKey{Hash: rf.FileHash, Path: rf.Path}]; ok {
+			continue
+		}
+		log.WithFields(log.Fields{
+			"resource_id": id,
+			"hash":        rf.FileHash,
+			"path":        rf.Path,
+		}).Info("pruning stale resource_file link after re-store")
+		if _, err := db.Model(&rf).Context(ctx).WherePK().Delete(); err != nil {
+			return errors.Wrap(err, "failed to delete stale resource_file link")
+		}
+		if err := s.gcFileIfUnreferenced(ctx, db, rf.FileHash); err != nil {
+			return errors.Wrap(err, "failed to gc unreferenced file after prune")
+		}
+	}
+
 	res := &Resource{ID: id, Status: StatusStored}
 	_, err = db.Model(res).
 		Context(ctx).
@@ -567,6 +619,63 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	if err != nil {
 		return errors.Wrap(err, "failed to update resource status to stored")
 	}
+	return nil
+}
+
+// gcFileIfUnreferenced drops a file row and its S3 artefact (completed
+// object or in-flight multipart upload) if no resource_file row still
+// references its hash. Called after a resource_file row is deleted to
+// keep storage usage in sync with logical references. Safe to call when
+// the hash is still referenced — it becomes a no-op.
+func (s *Worker) gcFileIfUnreferenced(ctx context.Context, db *pg.DB, hash string) error {
+	if s.bucket == "" {
+		return errors.New("s3 bucket is not configured")
+	}
+	count, err := db.Model((*ResourceFile)(nil)).
+		Context(ctx).
+		Where("file_hash = ?", hash).
+		Count()
+	if err != nil {
+		return errors.Wrap(err, "failed to count file references during gc")
+	}
+	if count > 0 {
+		return nil
+	}
+	f := &File{Hash: hash}
+	if err := db.Model(f).Context(ctx).WherePK().Select(); err != nil {
+		if errors.Is(err, pg.ErrNoRows) {
+			return nil
+		}
+		return errors.Wrap(err, "failed to load file row during gc")
+	}
+	s3Cl := s.s3.Get()
+	// Abort any in-flight multipart upload so we don't leave parts
+	// accruing quota. Best-effort: the 7-day S3 lifecycle rule is the
+	// ultimate backstop.
+	if f.UploadID != "" {
+		if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(hash),
+			UploadId: aws.String(f.UploadID),
+		}); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"hash":      hash,
+				"upload_id": f.UploadID,
+			}).Warn("failed to abort multipart upload during gc; continuing")
+		}
+	}
+	// Delete the completed object if any. Harmless when the key does
+	// not exist (e.g. we only had an in-flight multipart).
+	if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(hash),
+	}); err != nil {
+		return errors.Wrapf(err, "failed to delete s3 object during gc, bucket=%s, key=%s", s.bucket, hash)
+	}
+	if _, err := db.Model(f).Context(ctx).WherePK().Delete(); err != nil && !errors.Is(err, pg.ErrNoRows) {
+		return errors.Wrap(err, "failed to delete file row during gc")
+	}
+	log.WithFields(log.Fields{"bucket": s.bucket, "hash": hash}).Info("gc removed unreferenced file")
 	return nil
 }
 
@@ -621,8 +730,25 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 			Update(); err != nil && !errors.Is(err, pg.ErrNoRows) {
 			return errors.Wrap(err, "failed to mark file as deleting")
 		}
-		// No more references — delete S3 object (if configured) and file row
+		// If the file was still in-flight (multipart upload not yet
+		// completed), abort the upload so its parts don't accumulate
+		// S3 quota. Best-effort: a 7-day bucket lifecycle rule is the
+		// ultimate backstop, but aborting here keeps cleanup prompt.
 		s3Cl := s.s3.Get()
+		if f.UploadID != "" {
+			if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(rf.FileHash),
+				UploadId: aws.String(f.UploadID),
+			}); err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"bucket":    s.bucket,
+					"key":       rf.FileHash,
+					"upload_id": f.UploadID,
+				}).Warn("failed to abort multipart upload during delete; continuing")
+			}
+		}
+		// No more references — delete S3 object (if configured) and file row
 		_, delErr := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(rf.FileHash),

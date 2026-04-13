@@ -6,6 +6,16 @@ definitions:
     type: object
   services.Resource:
     properties:
+      claim_expires_at:
+        description: |-
+          Lease columns (migration 8). A non-null claim_expires_at in the future
+          means the row is owned by the worker in claimed_by for that duration.
+          Heartbeat refreshes the deadline; on crash or shutdown the lease
+          naturally expires and another worker can reclaim the row. This replaces
+          the old "row updated_at is stale" heuristic for cross-pod coordination.
+        type: string
+      claimed_by:
+        type: string
       created_at:
         type: string
       error:
@@ -30,6 +40,7 @@ definitions:
     - 4
     - 5
     - 6
+    format: int32
     type: integer
     x-enum-varnames:
     - StatusQueuedForStoring
@@ -113,8 +124,8 @@ paths:
       - resource
   /webseed/{id}/{path}:
     get:
-      description: Proxies stored files from S3 with Range support. Returns 404 if
-        resource is not fully stored or file not found.
+      description: Redirects to a presigned S3 URL for the stored file. Returns 404
+        if resource is not fully stored or file not found.
       parameters:
       - description: Resource ID
         in: path
@@ -126,13 +137,9 @@ paths:
         name: path
         required: true
         type: string
-      produces:
-      - application/octet-stream
       responses:
-        "200":
-          description: OK
-        "206":
-          description: Partial Content
+        "302":
+          description: Found
         "404":
           description: Not Found
           schema:
@@ -145,8 +152,8 @@ paths:
       tags:
       - webseed
     head:
-      description: Proxies stored files from S3 with Range support. Returns 404 if
-        resource is not fully stored or file not found.
+      description: Redirects to a presigned S3 URL for the stored file. Returns 404
+        if resource is not fully stored or file not found.
       parameters:
       - description: Resource ID
         in: path
@@ -158,13 +165,9 @@ paths:
         name: path
         required: true
         type: string
-      produces:
-      - application/octet-stream
       responses:
-        "200":
-          description: OK
-        "206":
-          description: Partial Content
+        "302":
+          description: Found
         "404":
           description: Not Found
           schema:
