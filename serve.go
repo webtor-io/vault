@@ -14,11 +14,13 @@ import (
 func configureServe(c *cli.Command) {
 	c.Flags = cs.RegisterProbeFlags(c.Flags)
 	c.Flags = cs.RegisterPprofFlags(c.Flags)
+	c.Flags = cs.RegisterPromFlags(c.Flags)
 	c.Flags = cs.RegisterPGFlags(c.Flags)
 	c.Flags = cs.RegisterS3ClientFlags(c.Flags)
 	c.Flags = services.RegisterWebFlags(c.Flags)
 	c.Flags = services.RegisterWorkerFlags(c.Flags)
 	c.Flags = services.RegisterApiFlags(c.Flags)
+	c.Flags = services.RegisterMetricsFlags(c.Flags)
 	c.Flags = cs.RegisterNATSFlags(c.Flags)
 }
 
@@ -62,6 +64,18 @@ func serve(c *cli.Context) (err error) {
 		svcs = append(svcs, pprof)
 		defer pprof.Close()
 	}
+
+	// Setting Prometheus exporter (/metrics on :8083 by default)
+	prom := cs.NewProm(c)
+	if prom != nil {
+		svcs = append(svcs, prom)
+		defer prom.Close()
+	}
+
+	// Setting vault metrics refresher — populates gauges consumed by prom
+	metrics := services.NewMetrics(c, pg)
+	svcs = append(svcs, metrics)
+	defer metrics.Close()
 
 	cl := &http.Client{
 		Timeout: 30 * time.Minute,
