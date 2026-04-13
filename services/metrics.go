@@ -52,6 +52,8 @@ type Metrics struct {
 	orphanBytes        prometheus.Gauge
 	multipartInFlight  prometheus.Gauge
 	leaseHeld          prometheus.Gauge
+	dedupLogicalBytes  prometheus.Gauge
+	dedupPhysicalBytes prometheus.Gauge
 	refreshErrors      prometheus.Counter
 	lastRefreshSuccess prometheus.Gauge
 	refreshDuration    prometheus.Histogram
@@ -119,6 +121,16 @@ func NewMetrics(c *cli.Context, pg *cs.PG) *Metrics {
 			Name:      "worker_leases_held",
 			Help:      "Number of resources currently claimed by a worker (claim_expires_at > now).",
 		}),
+		dedupLogicalBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "dedup_logical_bytes",
+			Help:      "Logical bytes in completed resources: sum(file.total_size * ref_count) for files with status=stored and at least one stored-resource reference. Counts a shared file once per referencing stored resource.",
+		}),
+		dedupPhysicalBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "dedup_physical_bytes",
+			Help:      "Physical bytes for the same set of files: sum(file.total_size) where file.status=stored AND referenced by at least one stored resource. Dedup savings = 1 - physical / logical.",
+		}),
 		refreshErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "metrics_refresh_errors_total",
@@ -141,6 +153,7 @@ func NewMetrics(c *cli.Context, pg *cs.PG) *Metrics {
 		m.fileCount, m.fileBytes, m.fileStored,
 		m.orphanCount, m.orphanBytes,
 		m.multipartInFlight, m.leaseHeld,
+		m.dedupLogicalBytes, m.dedupPhysicalBytes,
 		m.refreshErrors, m.lastRefreshSuccess, m.refreshDuration,
 	)
 	return m
@@ -279,6 +292,33 @@ func (m *Metrics) doRefresh(ctx context.Context) error {
 		return errors.Wrap(err, "lease count query failed")
 	}
 	m.leaseHeld.Set(float64(leaseCount))
+
+	// Dedup accounting for stored files under stored resources. Logical
+	// counts each file once per stored-resource that references it;
+	// physical counts each unique file once. savings = 1 - phys/logical.
+	var dedup struct {
+		Logical  int64 `pg:"logical"`
+		Physical int64 `pg:"physical"`
+	}
+	if _, err := db.QueryOneContext(ctx, &dedup, `
+		WITH ref_counts AS (
+			SELECT rf.file_hash, count(*)::bigint AS refs
+			FROM resource_file rf
+			JOIN resource r ON r.resource_id = rf.resource_id
+			WHERE r.status = 2
+			GROUP BY rf.file_hash
+		)
+		SELECT
+			COALESCE(SUM(f.total_size * rc.refs), 0)::bigint AS logical,
+			COALESCE(SUM(f.total_size),           0)::bigint AS physical
+		FROM ref_counts rc
+		JOIN file f ON f.hash = rc.file_hash
+		WHERE f.status = 2
+	`); err != nil {
+		return errors.Wrap(err, "dedup aggregate query failed")
+	}
+	m.dedupLogicalBytes.Set(float64(dedup.Logical))
+	m.dedupPhysicalBytes.Set(float64(dedup.Physical))
 
 	return nil
 }
