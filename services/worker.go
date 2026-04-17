@@ -474,13 +474,19 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// for any reason, the heartbeat goroutine cancels ctx and every DB
 	// operation below returns promptly with context.Canceled.
 	//
-	// Orphan-safety invariant: `resource_file` is never wiped up-front.
-	// Old links are pruned only AFTER the new listing has been fully
-	// processed (diff-based pruning at the end). This guarantees that at
-	// any intermediate point — including a crash, a lease loss, or an
-	// incoming queued_for_deletion — `resource_file` reflects a valid
-	// superset of the files that are currently in S3, so `handleDelete`
-	// can still find and clean them up.
+	// Orphan-safety invariant:
+	// 1) File status is flipped to `stored` only inside the atomic
+	//    transaction that also inserts the `resource_file` link. So every
+	//    file with status=stored is guaranteed to have at least one
+	//    resource_file row, and `handleDelete` can always find it.
+	// 2) `resource_file` is never wiped up-front. Old links are pruned
+	//    only AFTER the new listing has been fully processed (diff-based
+	//    pruning at the end). This guarantees that at any intermediate
+	//    point — including a crash, a lease loss, or an incoming
+	//    queued_for_deletion — `resource_file` reflects a valid superset
+	//    of the files that are currently in S3.
+	// 3) `handleDelete` runs a post-deletion orphan sweep to catch any
+	//    `file` rows left behind by cancelled store attempts.
 
 	listArgs := &ListResourceContentArgs{
 		Limit:  100,
@@ -679,6 +685,77 @@ func (s *Worker) gcFileIfUnreferenced(ctx context.Context, db *pg.DB, hash strin
 	return nil
 }
 
+// sweepOrphanFiles finds `file` rows with no `resource_file` reference
+// whose updated_at is older than leaseDuration (meaning the creating
+// worker has certainly abandoned them) and removes them from S3 and the
+// database. Called from handleDelete as a post-deletion safety net.
+// Returns the number of files removed. Only a query-level failure is
+// returned; per-file errors are logged and skipped.
+func (s *Worker) sweepOrphanFiles(ctx context.Context, db *pg.DB) (int, error) {
+	cutoff := time.Now().Add(-leaseDuration)
+	var orphans []File
+	err := db.Model(&orphans).
+		Context(ctx).
+		ColumnExpr(`"file".*`).
+		Join(`LEFT JOIN resource_file AS rf ON rf.file_hash = "file".hash`).
+		Where(`rf.resource_id IS NULL`).
+		Where(`"file".updated_at < ?`, cutoff).
+		OrderExpr(`"file".updated_at ASC`).
+		Limit(100).
+		Select()
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to query orphan files for sweep")
+	}
+	if len(orphans) == 0 {
+		return 0, nil
+	}
+	s3Cl := s.s3.Get()
+	swept := 0
+	for i := range orphans {
+		f := &orphans[i]
+		// Re-check reference count — a worker may have linked this file
+		// between our query and now.
+		cnt, cntErr := db.Model((*ResourceFile)(nil)).
+			Context(ctx).
+			Where("file_hash = ?", f.Hash).
+			Count()
+		if cntErr != nil {
+			log.WithError(cntErr).WithField("hash", f.Hash).Warn("sweep: re-check failed; skipping")
+			continue
+		}
+		if cnt > 0 {
+			continue
+		}
+		if f.UploadID != "" {
+			if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(f.Hash),
+				UploadId: aws.String(f.UploadID),
+			}); err != nil {
+				log.WithError(err).WithField("hash", f.Hash).Warn("sweep: abort multipart failed; continuing")
+			}
+		}
+		if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(f.Hash),
+		}); err != nil {
+			log.WithError(err).WithField("hash", f.Hash).Warn("sweep: S3 delete failed; skipping")
+			continue
+		}
+		if _, err := db.Model(f).Context(ctx).WherePK().Delete(); err != nil && !errors.Is(err, pg.ErrNoRows) {
+			log.WithError(err).WithField("hash", f.Hash).Warn("sweep: DB delete failed")
+			continue
+		}
+		swept++
+		log.WithFields(log.Fields{
+			"hash":       f.Hash,
+			"total_size": f.TotalSize,
+			"status":     f.Status.String(),
+		}).Info("sweep: removed orphan file")
+	}
+	return swept, nil
+}
+
 func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err error) {
 	if s.bucket == "" {
 		return errors.New("s3 bucket is not configured")
@@ -769,6 +846,17 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	if err != nil {
 		return errors.Wrap(err, "failed to delete resource from database")
 	}
+
+	// Best-effort orphan sweep: clean up `file` rows that have no
+	// resource_file references. These can appear when a store attempt
+	// was cancelled (lease loss, incoming deletion) after uploading to
+	// S3 but before the atomic transaction that links file → resource.
+	if swept, swErr := s.sweepOrphanFiles(ctx, db); swErr != nil {
+		log.WithError(swErr).Warn("post-delete orphan sweep failed")
+	} else if swept > 0 {
+		log.WithField("swept", swept).Info("post-delete orphan sweep removed files")
+	}
+
 	return nil
 }
 
@@ -1263,13 +1351,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, errors.Wrapf(err, "failed to complete S3 multipart upload, bucket=%s, key=%s, upload_id=%s", s.bucket, hash, f.UploadID)
 	}
 
-	// Ensure file status and stored_size are finalized
-	f.Status = StatusStored
-	f.StoredSize = f.TotalSize
-	f.UploadID = ""
-	if _, err := db.Model(f).Context(ctx).Column("status", "stored_size", "upload_id").WherePK().Update(); err != nil {
-		return nil, errors.Wrap(err, "failed to finalize file status after upload")
-	}
+	// NOTE: file status intentionally stays `storing` here. The sole
+	// point that flips a file to `stored` is the atomic transaction in
+	// handleStore, which sets status=stored AND inserts the resource_file
+	// link in one commit. This guarantees every `stored` file always has
+	// at least one resource_file reference, eliminating the orphan window
+	// that previously existed between this point and the transaction.
 	log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": item.Size}).Info("stored to s3")
 	return f, nil
 }
