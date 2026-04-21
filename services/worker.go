@@ -1253,8 +1253,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err != nil {
 		return nil, err
 	}
-	defer func() { dcancel() }()
-	defer func() { _ = r.Close() }()
+	defer func() {
+		if dcancel != nil {
+			dcancel()
+		}
+	}()
+	defer func() {
+		if r != nil {
+			_ = r.Close()
+		}
+	}()
 
 	for stored < f.TotalSize {
 		select {
