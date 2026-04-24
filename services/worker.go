@@ -1081,6 +1081,36 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return nil, errors.Wrap(err, "failed to insert file")
 	}
 
+	// Zero-byte files can't use multipart upload — S3 rejects
+	// CompleteMultipartUpload with an empty parts list (MalformedXML).
+	// All empty files share the same hash (sha256 of the size string "0"),
+	// so a single empty S3 object is enough for dedup.
+	if f.TotalSize == 0 {
+		if f.UploadID != "" {
+			_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(hash),
+				UploadId: aws.String(f.UploadID),
+			})
+			f.UploadID = ""
+			f.StoredSize = 0
+			f.PartSize = partSize
+			if _, err := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); err != nil {
+				return nil, errors.Wrap(err, "failed to reset upload for zero-byte file")
+			}
+		}
+		_, err := s3Cl.PutObjectWithContext(ctx, &awss3.PutObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(hash),
+			Body:   bytes.NewReader(nil),
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to put zero-byte object, bucket=%s, key=%s", s.bucket, hash)
+		}
+		log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": 0}).Info("stored zero-byte file to s3")
+		return f, nil
+	}
+
 	if f.UploadID != "" && f.PartSize != partSize {
 		log.WithFields(log.Fields{
 			"hash":          hash,
@@ -1302,8 +1332,14 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 					"stored":      stored,
 					"attempt":     attempt,
 				}).WithError(readErr).Warn("download stream interrupted, reconnecting")
-				_ = r.Close()
-				dcancel()
+				// r/dcancel may be nil if a previous openDownload() in this
+				// retry loop failed — only clean up a live reader.
+				if r != nil {
+					_ = r.Close()
+				}
+				if dcancel != nil {
+					dcancel()
+				}
 				time.Sleep(time.Duration(attempt) * 5 * time.Second)
 				r, dcancel, err = openDownload()
 				if err != nil {
