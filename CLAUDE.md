@@ -25,7 +25,7 @@ There are no tests in this repository currently.
 
 **Entry point:** `main.go` → `configure.go` → `serve.go`
 
-The `serve` command initializes all components in order: PG connection → migrations → probe/pprof → S3 client → Web server → REST API client → NATS → Worker. All implement `cs.Servable` and are managed by `common-services.Serve`.
+The `serve` command initializes all components in order: PG connection → migrations → probe/pprof → S3 client → Web server → REST API client → NATS → Worker → EventHandler. All implement `cs.Servable` and are managed by `common-services.Serve`.
 
 **`services/` package — all core logic lives here:**
 
@@ -37,6 +37,7 @@ The `serve` command initializes all components in order: PG connection → migra
 | `models.go` | Data models (`Resource`, `File`, `ResourceFile`, `OperationLog`) and go-pg DB helpers |
 | `worker.go` | Background job processor — polls DB every 5s, downloads from REST API, multipart-uploads to S3, publishes NATS events |
 | `api.go` | Client for Webtor's external REST API with JWT auth — fetches torrent content lists and downloads file ranges |
+| `event_handler.go` | JetStream pull subscriber on `resource.banned` (published by abuse-store on illegal-content reports) — funnels banned infohashes into `ResourceQueueForDeletion` so the worker tears them down. Skipped when NATS or PG is not configured |
 
 **Key design patterns:**
 - All store/delete operations are **asynchronous** — API returns 202, worker processes later

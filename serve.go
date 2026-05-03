@@ -103,6 +103,13 @@ func serve(c *cli.Context) (err error) {
 	svcs = append(svcs, worker)
 	defer worker.Close()
 
+	// Setting EventHandler
+	events := services.NewEventHandler(pg, nt)
+	if events != nil {
+		svcs = append(svcs, events)
+		defer events.Close()
+	}
+
 	// Setting Serve
 	s := cs.NewServe(svcs...)
 
