@@ -488,20 +488,45 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// 3) `handleDelete` runs a post-deletion orphan sweep to catch any
 	//    `file` rows left behind by cancelled store attempts.
 
-	listArgs := &ListResourceContentArgs{
-		Limit:  100,
-		Offset: 0,
-	}
 	cla := &Claims{
 		Role: "vault",
 	}
 
-	// Reset resource counters before (re)storing. Only the numeric counters
-	// are reset here — `resource_file` rows are preserved so that a partial
-	// re-store cannot drop links to files that are still in S3.
+	// Phase 1: prefetch the full listing and compute final total_size up
+	// front. This way the UI's stored/total ratio rises monotonically
+	// instead of bouncing 100% → 99% → 100% on every page boundary as
+	// each newly discovered file inflates the denominator.
+	listArgs := &ListResourceContentArgs{
+		Limit:  100,
+		Offset: 0,
+	}
+	var fileItems []ra.ListItem
+	var totalSize int64
+	for {
+		resp, err := s.api.ListResourceContent(ctx, cla, id, listArgs)
+		if err != nil {
+			return errors.Wrap(err, "failed to list resource content")
+		}
+		for _, item := range resp.Items {
+			if item.Type == ra.ListTypeFile {
+				fileItems = append(fileItems, item)
+				totalSize += item.Size
+			}
+		}
+		if len(resp.Items) < int(listArgs.Limit) {
+			break
+		}
+		listArgs.Offset += listArgs.Limit
+	}
+
+	// Reset resource counters before (re)storing. total_size is now known
+	// and pinned for the whole run; stored_size is rebuilt from zero so the
+	// progress ratio is consistent with what we are about to upload.
+	// `resource_file` rows are preserved so that a partial re-store cannot
+	// drop links to files that are still in S3.
 	if _, err := db.Model(&Resource{ID: id}).
 		Context(ctx).
-		Set("total_size = 0").
+		Set("total_size = ?", totalSize).
 		Set("stored_size = 0").
 		Set("updated_at = now()").
 		Set("error = null").
@@ -516,78 +541,53 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	type rfKey struct{ Hash, Path string }
 	expected := make(map[rfKey]struct{})
 
-	var totalSize, totalStored int64
-	// Paginate through results to find the file at the specified index
-	for {
-		resp, err := s.api.ListResourceContent(ctx, cla, id, listArgs)
+	var totalStored int64
+	// Phase 2: store files sequentially using the fixed listing.
+	for _, item := range fileItems {
+		f, err := s.storeFile(ctx, cla, id, item, totalStored)
 		if err != nil {
-			return errors.Wrap(err, "failed to list resource content")
+			return errors.Wrap(err, "failed to store file")
 		}
-		for _, item := range resp.Items {
-			if item.Type == ra.ListTypeFile {
-				// First, increment total size for the resource
-				totalSize += item.Size
-				if _, err := db.Model(&Resource{ID: id}).
-					Context(ctx).
-					Set("total_size = ?", totalSize).
-					Where("resource_id = ?", id).
-					Update(); err != nil {
-					return errors.Wrap(err, "failed to update resource total_size")
-				}
+		totalStored += item.Size
 
-				f, err := s.storeFile(ctx, cla, id, item, totalStored)
-				if err != nil {
-					return errors.Wrap(err, "failed to store file")
-				}
-				totalStored += item.Size
-
-				// Atomically finalize the file to `stored` and link it to
-				// the resource. Wrapping both statements in one transaction
-				// closes the window where a file is in S3 but has no
-				// resource_file row (which would leak it on deletion).
-				// Works for all storeFile return paths: for dedup/hash
-				// hits the UPDATE is a no-op.
-				if err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
-					if _, err := tx.Model((*File)(nil)).
-						Set("status = ?", StatusStored).
-						Set("stored_size = ?", f.TotalSize).
-						Set("upload_id = ''").
-						Set("updated_at = now()").
-						Where("hash = ?", f.Hash).
-						Update(); err != nil {
-						return errors.Wrap(err, "failed to finalize file status")
-					}
-					rf := &ResourceFile{
-						ResourceID: id,
-						FileHash:   f.Hash,
-						Path:       item.PathStr,
-					}
-					if _, err := tx.Model(rf).OnConflict("DO NOTHING").Insert(); err != nil {
-						return errors.Wrap(err, "failed to insert resource_file")
-					}
-					return nil
-				}); err != nil {
-					return err
-				}
-				expected[rfKey{Hash: f.Hash, Path: item.PathStr}] = struct{}{}
-
-				if _, err := db.Model(&Resource{ID: id}).
-					Context(ctx).
-					Set("stored_size = ?", totalStored).
-					Set("error = null").
-					Where("resource_id = ?", id).
-					Update(); err != nil {
-					return errors.Wrap(err, "failed to update resource stored_size")
-				}
+		// Atomically finalize the file to `stored` and link it to
+		// the resource. Wrapping both statements in one transaction
+		// closes the window where a file is in S3 but has no
+		// resource_file row (which would leak it on deletion).
+		// Works for all storeFile return paths: for dedup/hash
+		// hits the UPDATE is a no-op.
+		if err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
+			if _, err := tx.Model((*File)(nil)).
+				Set("status = ?", StatusStored).
+				Set("stored_size = ?", f.TotalSize).
+				Set("upload_id = ''").
+				Set("updated_at = now()").
+				Where("hash = ?", f.Hash).
+				Update(); err != nil {
+				return errors.Wrap(err, "failed to finalize file status")
 			}
+			rf := &ResourceFile{
+				ResourceID: id,
+				FileHash:   f.Hash,
+				Path:       item.PathStr,
+			}
+			if _, err := tx.Model(rf).OnConflict("DO NOTHING").Insert(); err != nil {
+				return errors.Wrap(err, "failed to insert resource_file")
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
+		expected[rfKey{Hash: f.Hash, Path: item.PathStr}] = struct{}{}
 
-		// Check if we've reached the end
-		if len(resp.Items) < int(listArgs.Limit) {
-			break
+		if _, err := db.Model(&Resource{ID: id}).
+			Context(ctx).
+			Set("stored_size = ?", totalStored).
+			Set("error = null").
+			Where("resource_id = ?", id).
+			Update(); err != nil {
+			return errors.Wrap(err, "failed to update resource stored_size")
 		}
-
-		listArgs.Offset += listArgs.Limit
 	}
 
 	// All new files are stored and linked. Now diff-prune: drop any
