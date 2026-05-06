@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	verifyExistingThresholdFlag = "verify-threshold"
-	verifyExistingDryRunFlag    = "verify-dry-run"
-	verifyExistingLimitFlag     = "verify-limit"
+	verifyExistingThresholdFlag  = "verify-threshold"
+	verifyExistingDryRunFlag     = "verify-dry-run"
+	verifyExistingLimitFlag      = "verify-limit"
+	verifyExistingResourceIDFlag = "verify-resource-id"
 )
 
 func RegisterVerifyExistingFlags(f []cli.Flag) []cli.Flag {
@@ -44,20 +45,27 @@ func RegisterVerifyExistingFlags(f []cli.Flag) []cli.Flag {
 			Usage:  "report mismatches without invalidating files or re-queueing resources",
 			EnvVar: "VAULT_VERIFY_DRY_RUN",
 		},
+		cli.StringFlag{
+			Name:   verifyExistingResourceIDFlag,
+			Usage:  "verify a single resource by infohash (overrides threshold/limit)",
+			EnvVar: "VAULT_VERIFY_RESOURCE_ID",
+		},
 	)
 }
 
 type VerifyExistingOptions struct {
-	Threshold int64
-	Limit     int
-	DryRun    bool
+	Threshold  int64
+	Limit      int
+	DryRun     bool
+	ResourceID string
 }
 
 func VerifyExistingOptionsFromContext(c *cli.Context) VerifyExistingOptions {
 	return VerifyExistingOptions{
-		Threshold: c.Int64(verifyExistingThresholdFlag),
-		Limit:     c.Int(verifyExistingLimitFlag),
-		DryRun:    c.Bool(verifyExistingDryRunFlag),
+		Threshold:  c.Int64(verifyExistingThresholdFlag),
+		Limit:      c.Int(verifyExistingLimitFlag),
+		DryRun:     c.Bool(verifyExistingDryRunFlag),
+		ResourceID: c.String(verifyExistingResourceIDFlag),
 	}
 }
 
@@ -98,10 +106,14 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 	q := db.Model(&resources).
 		Context(ctx).
 		Where("status = ?", StatusStored).
-		OrderExpr("total_size DESC").
-		Limit(opts.Limit)
-	if opts.Threshold > 0 {
-		q = q.Where("total_size >= ?", opts.Threshold)
+		OrderExpr("total_size DESC")
+	if opts.ResourceID != "" {
+		q = q.Where("resource_id = ?", opts.ResourceID)
+	} else {
+		q = q.Limit(opts.Limit)
+		if opts.Threshold > 0 {
+			q = q.Where("total_size >= ?", opts.Threshold)
+		}
 	}
 	if err := q.Select(); err != nil {
 		return stats, errors.Wrap(err, "failed to list stored resources")
