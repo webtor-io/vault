@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -269,6 +270,37 @@ func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.
 		u = ur.String()
 	}
 	return http.NewRequestWithContext(ctx, "GET", u, nil)
+}
+
+// FetchTorrent retrieves the bencode .torrent for the resource hosted at the
+// seeder behind the given export URL. It reuses the auth tokens already
+// embedded in the export URL by replacing only the file-path component with
+// "/source.torrent" — the seeder serves the torrent at that route via
+// renderTorrent (see torrent-web-seeder/server/services/web_seeder.go).
+func (s *Api) FetchTorrent(ctx context.Context, exportURL string) ([]byte, error) {
+	u, err := url.Parse(exportURL)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse export URL")
+	}
+	parts := strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 2)
+	if len(parts) < 1 || parts[0] == "" {
+		return nil, errors.Errorf("unexpected export URL path %q", u.Path)
+	}
+	u.Path = "/" + parts[0] + "/source.torrent"
+
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, u.String())
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.cl.Do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to fetch torrent")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.Errorf("unexpected status %d fetching torrent from %s", res.StatusCode, u.String())
+	}
+	return io.ReadAll(res.Body)
 }
 
 func (s *Api) DownloadWithRange(ctx context.Context, u string, start int, end int) (io.ReadCloser, error) {
