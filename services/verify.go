@@ -75,43 +75,67 @@ func parseMetainfo(data []byte) (*metainfo.Info, error) {
 // for piece-aligned files there are zero. The intermediate (fully-contained)
 // pieces detect the seeder's eviction-during-read bug, which zeroes whole
 // pieces — so even partial coverage catches the failure mode in practice.
+//
+// Performance: stream the entire file once with a single S3 GET and hash
+// each piece as bytes pass through. This is bandwidth-bound rather than
+// round-trip-bound, an order of magnitude faster than per-piece Range GETs.
 func verifyFileAgainstMetainfo(ctx context.Context, s3Cl *awss3.S3, bucket, key string, mi *metainfo.Info, fileOffset, fileLen int64) error {
+	if fileLen == 0 {
+		return nil
+	}
+	pieceLen := mi.PieceLength
+	if pieceLen <= 0 {
+		return errors.Errorf("verify: invalid piece length %d", pieceLen)
+	}
 	fileEnd := fileOffset + fileLen
-	verified := 0
+
+	// First fully-contained piece (rounded up to next piece boundary in the
+	// torrent's global offset space) and last fully-contained piece.
+	firstFullGlobal := ((fileOffset + pieceLen - 1) / pieceLen) * pieceLen
+	lastFullGlobal := (fileEnd / pieceLen) * pieceLen
+	if firstFullGlobal >= lastFullGlobal {
+		log.WithFields(log.Fields{
+			"key":              key,
+			"verified_pieces":  0,
+			"skipped_boundary": 2,
+		}).Info("integrity verification: file too small to contain a full piece")
+		return nil
+	}
+
+	startInFile := firstFullGlobal - fileOffset
+	endInFile := lastFullGlobal - fileOffset
+
+	out, err := s3Cl.GetObjectWithContext(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startInFile, endInFile-1)),
+	})
+	if err != nil {
+		return errors.Wrapf(err, "verify: GET key=%s range=%d-%d", key, startInFile, endInFile-1)
+	}
+	defer out.Body.Close()
+
 	skipped := 0
+	if firstFullGlobal > fileOffset {
+		skipped++
+	}
+	if lastFullGlobal < fileEnd {
+		skipped++
+	}
 
-	for idx := 0; idx < mi.NumPieces(); idx++ {
+	verified := 0
+	buf := make([]byte, pieceLen)
+	for pieceGlobal := firstFullGlobal; pieceGlobal < lastFullGlobal; pieceGlobal += pieceLen {
+		idx := int(pieceGlobal / pieceLen)
 		piece := mi.Piece(idx)
-		pStart := piece.Offset()
-		pEnd := pStart + piece.Length()
-
-		if pEnd <= fileOffset || pStart >= fileEnd {
-			continue
+		if piece.Length() != pieceLen {
+			return errors.Errorf("verify: piece %d expected length %d, got %d", idx, pieceLen, piece.Length())
 		}
-		if pStart < fileOffset || pEnd > fileEnd {
-			skipped++
-			continue
-		}
-
-		rangeStart := pStart - fileOffset
-		rangeEnd := pEnd - fileOffset - 1
-		out, err := s3Cl.GetObjectWithContext(ctx, &awss3.GetObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)),
-		})
-		if err != nil {
-			return errors.Wrapf(err, "verify: GET piece %d range bytes=%d-%d", idx, rangeStart, rangeEnd)
+		if _, err := io.ReadFull(out.Body, buf); err != nil {
+			return errors.Wrapf(err, "verify: read piece %d from stream", idx)
 		}
 		h := sha1.New()
-		n, copyErr := io.Copy(h, out.Body)
-		_ = out.Body.Close()
-		if copyErr != nil {
-			return errors.Wrapf(copyErr, "verify: read piece %d", idx)
-		}
-		if n != piece.Length() {
-			return errors.Errorf("verify: piece %d short read got=%d want=%d", idx, n, piece.Length())
-		}
+		_, _ = h.Write(buf)
 		got := h.Sum(nil)
 		wantOpt := piece.V1Hash()
 		if !wantOpt.Ok {
