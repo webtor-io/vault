@@ -7,5 +7,6 @@ import (
 func configure(app *cli.App) {
 	serveCmd := makeServeCMD()
 	gcCmd := makeGCCMD()
-	app.Commands = []cli.Command{serveCmd, gcCmd}
+	verifyCmd := makeVerifyExistingCMD()
+	app.Commands = []cli.Command{serveCmd, gcCmd, verifyCmd}
 }
