@@ -30,8 +30,10 @@ func (s *Worker) verifyExistingS3Object(ctx context.Context, hash string, item r
 // fileOffsetInTorrent returns the byte offset at which the given file
 // starts inside the torrent's global piece sequence, or -1 if not found.
 // pathStr is the rest-api's ListItem.PathStr — leading "/" plus
-// "/"-joined path components. Single-file torrents return 0 when the
-// trimmed path matches Name.
+// "/"-joined path components. For multi-file torrents the path also
+// carries the root directory (Info.Name) as its first component, so we
+// strip that before matching against Info.Files[i].Path. Single-file
+// torrents match the trimmed path directly against Info.Name.
 func fileOffsetInTorrent(mi *metainfo.Info, pathStr string, length int64) int64 {
 	trimmed := strings.TrimPrefix(pathStr, "/")
 	if len(mi.Files) == 0 {
@@ -40,10 +42,11 @@ func fileOffsetInTorrent(mi *metainfo.Info, pathStr string, length int64) int64 
 		}
 		return -1
 	}
+	withoutRoot := strings.TrimPrefix(trimmed, mi.Name+"/")
 	var off int64
 	for _, f := range mi.Files {
 		joined := strings.Join(f.Path, "/")
-		if joined == trimmed && f.Length == length {
+		if (joined == withoutRoot || joined == trimmed) && f.Length == length {
 			return off
 		}
 		off += f.Length
