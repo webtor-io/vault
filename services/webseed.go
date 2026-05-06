@@ -17,7 +17,7 @@ const presignTTL = 1 * time.Hour
 
 // WebSeed handler — GET/HEAD /webseed/{id}/{path}
 // @Summary      Webseed proxy
-// @Description  Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.
+// @Description  Redirects to a presigned S3 URL for the stored file. Root path requires the whole resource to be stored; per-file paths are served as soon as the individual file is stored, even if the resource as a whole is still uploading.
 // @Tags         webseed
 // @Param        id    path      string  true  "Resource ID"
 // @Param        path  path      string  true  "Path inside resource"
@@ -40,17 +40,27 @@ func (s *Web) webSeed(c *gin.Context) {
 		_ = c.Error(err)
 		return
 	}
-	if res == nil || res.Status != StatusStored {
+	if res == nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
 
+	// Root: signals "whole torrent is in vault" — used by clients to
+	// short-circuit availability checks. Stays gated on resource status.
 	if p == "" || p == "/" {
+		if res.Status != StatusStored {
+			c.Status(http.StatusNotFound)
+			return
+		}
 		c.Status(http.StatusOK)
 		return
 	}
 
-	hash, ok, err := s.lookupFileHash(c.Request.Context(), db, id, p)
+	// Per-file: serve as soon as this specific file finished uploading,
+	// independent of the resource's aggregate status. Lets partially
+	// uploaded torrents (e.g. a TV series mid-store) be streamed for
+	// already-stored episodes.
+	hash, ok, err := s.lookupStoredFileHash(c.Request.Context(), db, id, p)
 	if err != nil {
 		_ = c.Error(err)
 		return
@@ -108,13 +118,22 @@ func (s *Web) validateWebSeedDependencies(c *gin.Context) bool {
 	return true
 }
 
-func (s *Web) lookupFileHash(ctx context.Context, db *pg.DB, id, path string) (string, bool, error) {
-	rf := &ResourceFile{ResourceID: id, Path: path}
-	if err := db.Model(rf).Context(ctx).Where("resource_id = ? and path = ?", id, path).Select(); err != nil {
+func (s *Web) lookupStoredFileHash(ctx context.Context, db *pg.DB, id, path string) (string, bool, error) {
+	rf := &ResourceFile{}
+	err := db.Model(rf).
+		Context(ctx).
+		Relation("File").
+		Where("resource_file.resource_id = ?", id).
+		Where("resource_file.path = ?", path).
+		Select()
+	if err != nil {
 		if errors.Is(err, pg.ErrNoRows) {
 			return "", false, nil
 		}
 		return "", false, err
+	}
+	if rf.File == nil || rf.File.Status != StatusStored {
+		return "", false, nil
 	}
 	return rf.FileHash, true, nil
 }

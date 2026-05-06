@@ -117,7 +117,7 @@ const docTemplatevault = `{
         },
         "/webseed/{id}/{path}": {
             "get": {
-                "description": "Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.",
+                "description": "Redirects to a presigned S3 URL for the stored file. Root path requires the whole resource to be stored; per-file paths are served as soon as the individual file is stored, even if the resource as a whole is still uploading.",
                 "tags": [
                     "webseed"
                 ],
@@ -157,7 +157,7 @@ const docTemplatevault = `{
                 }
             },
             "head": {
-                "description": "Redirects to a presigned S3 URL for the stored file. Returns 404 if resource is not fully stored or file not found.",
+                "description": "Redirects to a presigned S3 URL for the stored file. Root path requires the whole resource to be stored; per-file paths are served as soon as the individual file is stored, even if the resource as a whole is still uploading.",
                 "tags": [
                     "webseed"
                 ],
