@@ -124,18 +124,18 @@ func verifyFileAgainstMetainfo(ctx context.Context, s3Cl *awss3.S3, bucket, key 
 	}
 
 	verified := 0
-	buf := make([]byte, pieceLen)
 	for pieceGlobal := firstFullGlobal; pieceGlobal < lastFullGlobal; pieceGlobal += pieceLen {
 		idx := int(pieceGlobal / pieceLen)
 		piece := mi.Piece(idx)
 		if piece.Length() != pieceLen {
 			return errors.Errorf("verify: piece %d expected length %d, got %d", idx, pieceLen, piece.Length())
 		}
-		if _, err := io.ReadFull(out.Body, buf); err != nil {
-			return errors.Wrapf(err, "verify: read piece %d from stream", idx)
-		}
+		// io.CopyN streams through an internal 32 KB buffer — memory
+		// footprint is constant regardless of piece size.
 		h := sha1.New()
-		_, _ = h.Write(buf)
+		if n, err := io.CopyN(h, out.Body, pieceLen); err != nil {
+			return errors.Wrapf(err, "verify: read piece %d from stream (got %d/%d)", idx, n, pieceLen)
+		}
 		got := h.Sum(nil)
 		wantOpt := piece.V1Hash()
 		if !wantOpt.Ok {
