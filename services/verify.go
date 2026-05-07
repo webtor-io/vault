@@ -13,19 +13,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	ra "github.com/webtor-io/rest-api/services"
 )
-
-// verifyExistingS3Object runs piece-hash verification against an S3 object
-// that was previously stored. Returns nil on success, error on mismatch or
-// inability to verify. Caller treats any error as "drop and re-upload".
-func (s *Worker) verifyExistingS3Object(ctx context.Context, hash string, item ra.ListItem, mi *metainfo.Info) error {
-	fileOff := fileOffsetInTorrent(mi, item.PathStr, item.Size)
-	if fileOff < 0 {
-		return errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
-	}
-	return verifyFileAgainstMetainfo(ctx, s.s3.Get(), s.bucket, hash, mi, fileOff, item.Size)
-}
 
 // fileOffsetInTorrent returns the byte offset at which the given file
 // starts inside the torrent's global piece sequence, or -1 if not found.

@@ -576,13 +576,28 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	expected := make(map[rfKey]struct{})
 
 	var totalStored int64
+	// prevFiles accumulates already-stored files in torrent global-offset
+	// order so that the next file's pieceVerifier can pull left-boundary
+	// prefix bytes from S3.
+	var prevFiles []prevFileInfo
 	// Phase 2: store files sequentially using the fixed listing.
 	for _, item := range fileItems {
-		f, err := s.storeFile(ctx, cla, id, item, totalStored, mi)
+		var fileOff int64 = -1
+		if mi != nil {
+			fileOff = fileOffsetInTorrent(mi, item.PathStr, item.Size)
+		}
+		f, err := s.storeFile(ctx, cla, id, item, totalStored, mi, prevFiles)
 		if err != nil {
 			return errors.Wrap(err, "failed to store file")
 		}
 		totalStored += item.Size
+		if mi != nil && fileOff >= 0 {
+			prevFiles = append(prevFiles, prevFileInfo{
+				torrentOff: fileOff,
+				length:     item.Size,
+				hash:       f.Hash,
+			})
+		}
 
 		// Atomically finalize the file to `stored` and link it to
 		// the resource. Wrapping both statements in one transaction
@@ -961,7 +976,7 @@ func runPeriodicFlush(ctx context.Context, fn func()) context.CancelFunc {
 	return cancel
 }
 
-func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64, mi *metainfo.Info) (*File, error) {
+func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64, mi *metainfo.Info, prevFiles []prevFileInfo) (*File, error) {
 
 	if s.bucket == "" {
 		return nil, errors.New("s3 bucket is not configured")
@@ -993,53 +1008,21 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			Key:    aws.String(existing.Hash),
 		})
 		if headErr == nil {
-			// Self-heal: if integrity verification is enabled, recheck the
-			// stored bytes against torrent piece hashes before short-circuiting.
-			// Catches corrupt blobs uploaded by older builds (pre-eviction-fix
-			// seeder) so that any new resource path-deduping against them
-			// triggers a clean re-upload instead of inheriting bad data.
-			if mi != nil {
-				if vErr := s.verifyExistingS3Object(ctx, existing.Hash, item, mi); vErr != nil {
-					log.WithError(vErr).WithFields(log.Fields{
-						"hash": existing.Hash,
-						"path": item.PathStr,
-					}).Warn("path-dedup candidate failed integrity verification, forcing re-upload")
-					if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-						Bucket: aws.String(s.bucket),
-						Key:    aws.String(existing.Hash),
-					}); err != nil {
-						return nil, errors.Wrap(err, "failed to delete corrupt dedup S3 object")
-					}
-					if _, err := db.Model(&existing).Context(ctx).
-						Set("status = ?", StatusStoring).
-						Set("stored_size = 0").
-						Set("upload_id = ''").
-						Set("updated_at = now()").
-						WherePK().Update(); err != nil {
-						return nil, errors.Wrap(err, "failed to reset corrupt dedup file row")
-					}
-					// Fall through to the regular upload path below.
-				} else {
-					return &existing, nil
-				}
-			} else {
-				return &existing, nil
-			}
-		} else {
-			log.WithError(headErr).WithFields(log.Fields{
-				"hash": existing.Hash,
-				"path": item.PathStr,
-			}).Warn("dedup candidate marked stored but missing in S3, forcing re-upload")
-			// Reset the stale row so the regular upload path below re-uploads it
-			// when the same content hash is recomputed via generateFileHash.
-			if _, err := db.Model(&existing).Context(ctx).
-				Set("status = ?", StatusStoring).
-				Set("stored_size = 0").
-				Set("upload_id = ''").
-				Set("updated_at = now()").
-				WherePK().Update(); err != nil {
-				return nil, errors.Wrap(err, "failed to reset stale stored file row from dedup")
-			}
+			return &existing, nil
+		}
+		log.WithError(headErr).WithFields(log.Fields{
+			"hash": existing.Hash,
+			"path": item.PathStr,
+		}).Warn("dedup candidate marked stored but missing in S3, forcing re-upload")
+		// Reset the stale row so the regular upload path below re-uploads it
+		// when the same content hash is recomputed via generateFileHash.
+		if _, err := db.Model(&existing).Context(ctx).
+			Set("status = ?", StatusStoring).
+			Set("stored_size = 0").
+			Set("upload_id = ''").
+			Set("updated_at = now()").
+			WherePK().Update(); err != nil {
+			return nil, errors.Wrap(err, "failed to reset stale stored file row from dedup")
 		}
 	}
 	// No existing stored file found by path+size, proceed with exporting and storing by content hash
@@ -1127,44 +1110,19 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			Key:    aws.String(hash),
 		})
 		if headErr == nil {
-			if mi != nil {
-				if vErr := s.verifyExistingS3Object(ctx, hash, item, mi); vErr != nil {
-					log.WithError(vErr).WithField("hash", hash).
-						Warn("hash-dedup candidate failed integrity verification, forcing re-upload")
-					if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-						Bucket: aws.String(s.bucket),
-						Key:    aws.String(hash),
-					}); err != nil {
-						return nil, errors.Wrap(err, "failed to delete corrupt hash-dedup S3 object")
-					}
-					f.Status = StatusStoring
-					f.StoredSize = 0
-					f.UploadID = ""
-					if _, err := db.Model(f).Context(ctx).
-						Column("status", "stored_size", "upload_id").
-						WherePK().Update(); err != nil {
-						return nil, errors.Wrap(err, "failed to reset corrupt hash-dedup file row")
-					}
-					// Fall through into the re-upload path below.
-				} else {
-					return f, nil
-				}
-			} else {
-				return f, nil
-			}
-		} else {
-			log.WithError(headErr).WithField("hash", hash).
-				Warn("file marked stored but missing in S3, re-uploading")
-			// Fall through into the re-upload path below. Reset the row so the
-			// multipart upload logic starts from scratch.
-			f.Status = StatusStoring
-			f.StoredSize = 0
-			f.UploadID = ""
-			if _, err := db.Model(f).Context(ctx).
-				Column("status", "stored_size", "upload_id").
-				WherePK().Update(); err != nil {
-				return nil, errors.Wrap(err, "failed to reset stale stored file row")
-			}
+			return f, nil
+		}
+		log.WithError(headErr).WithField("hash", hash).
+			Warn("file marked stored but missing in S3, re-uploading")
+		// Fall through into the re-upload path below. Reset the row so the
+		// multipart upload logic starts from scratch.
+		f.Status = StatusStoring
+		f.StoredSize = 0
+		f.UploadID = ""
+		if _, err := db.Model(f).Context(ctx).
+			Column("status", "stored_size", "upload_id").
+			WherePK().Update(); err != nil {
+			return nil, errors.Wrap(err, "failed to reset stale stored file row")
 		}
 	}
 	_, err = db.Model(f).Context(ctx).Insert()
@@ -1289,6 +1247,41 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 
 	if err := flush(stored); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
+	}
+
+	// Build the inline integrity verifier when metainfo is available. The
+	// verifier hashes piece-aligned chunks as they flow through this loop —
+	// catching a mismatch here lets us abort the multipart upload before
+	// committing bad bytes, instead of having to re-download from S3 after
+	// completion. Resume case: if `stored > 0`, Bootstrap pulls the already-
+	// uploaded prefix from this file's S3 object so the in-progress piece
+	// state matches the actual stored bytes.
+	var verifier *pieceVerifier
+	if mi != nil {
+		fileOff := fileOffsetInTorrent(mi, item.PathStr, item.Size)
+		if fileOff < 0 {
+			return nil, errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
+		}
+		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket))
+		if err := verifier.Bootstrap(ctx, hash, stored); err != nil {
+			// Bootstrap pulls already-uploaded bytes through the hasher;
+			// failure means the resume prefix is corrupt (or prev files
+			// can't be read). Abort the multipart upload and reset the
+			// row so the next worker pass starts the upload fresh.
+			log.WithError(err).WithField("hash", hash).Warn("verifier bootstrap failed, aborting and resetting upload state")
+			_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(hash),
+				UploadId: aws.String(f.UploadID),
+			})
+			f.UploadID = ""
+			f.StoredSize = 0
+			f.PartSize = partSize
+			if _, dbErr := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); dbErr != nil {
+				return nil, errors.Wrap(dbErr, "failed to reset upload after verifier bootstrap failure")
+			}
+			return nil, errors.Wrap(err, "verifier bootstrap")
+		}
 	}
 
 	const maxDownloadRetries = 3
@@ -1449,6 +1442,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			}
 		}
 
+		// Inline integrity check before the part is uploaded — catches a
+		// piece SHA-1 mismatch in time to abort the multipart upload
+		// without committing bad bytes.
+		if verifier != nil {
+			if vErr := verifier.Feed(ctx, buf); vErr != nil {
+				setUploadErr(errors.Wrap(vErr, "integrity verification failed during upload"))
+				break
+			}
+		}
+
 		jobs <- partJob{
 			partNumber: partNumber,
 			data:       buf,
@@ -1461,6 +1464,11 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	wg.Wait()
 
 	if uploadErr != nil {
+		_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(hash),
+			UploadId: aws.String(f.UploadID),
+		})
 		return nil, uploadErr
 	}
 
@@ -1484,27 +1492,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to complete S3 multipart upload, bucket=%s, key=%s, upload_id=%s", s.bucket, hash, f.UploadID)
-	}
-
-	if mi != nil {
-		fileOff := fileOffsetInTorrent(mi, item.PathStr, item.Size)
-		if fileOff < 0 {
-			_, _ = s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-				Bucket: aws.String(s.bucket),
-				Key:    aws.String(hash),
-			})
-			return nil, errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
-		}
-		if err := verifyFileAgainstMetainfo(ctx, s3Cl, s.bucket, hash, mi, fileOff, item.Size); err != nil {
-			// Drop the corrupt object so a subsequent retry recomputes
-			// the same content hash and re-uploads cleanly instead of
-			// dedup-short-circuiting on the bad blob.
-			_, _ = s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-				Bucket: aws.String(s.bucket),
-				Key:    aws.String(hash),
-			})
-			return nil, errors.Wrap(err, "integrity verification failed")
-		}
 	}
 
 	// NOTE: file status intentionally stays `storing` here. The sole
