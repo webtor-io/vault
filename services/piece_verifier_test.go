@@ -92,7 +92,7 @@ func TestPieceVerifier_SingleFile_PieceAligned_Clean(t *testing.T) {
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
 
 	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), bytes); err != nil {
@@ -110,7 +110,7 @@ func TestPieceVerifier_SingleFile_CorruptMiddlePiece(t *testing.T) {
 	corrupt[pieceLen+5] ^= 0xFF // flip a bit inside piece 1
 
 	v := newPieceVerifier(info, 0, int64(len(corrupt)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	err := v.Feed(context.Background(), corrupt)
@@ -128,7 +128,7 @@ func TestPieceVerifier_SingleFile_TruncatedLastPiece(t *testing.T) {
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
 
 	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), bytes); err != nil {
@@ -147,7 +147,7 @@ func TestPieceVerifier_MultiFile_LeftBoundary_Clean(t *testing.T) {
 	prev := []prevFileInfo{{torrentOff: offsets[0], length: int64(len(file1)), hash: file1Hash}}
 
 	v := newPieceVerifier(info, offsets[1], int64(len(file2)), prev, fakeFetcher(store))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), file2); err != nil {
@@ -170,7 +170,7 @@ func TestPieceVerifier_MultiFile_LeftBoundary_PrevCorrupt(t *testing.T) {
 	prev := []prevFileInfo{{torrentOff: offsets[0], length: int64(len(file1)), hash: file1Hash}}
 
 	v := newPieceVerifier(info, offsets[1], int64(len(file2)), prev, fakeFetcher(store))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	err := v.Feed(context.Background(), file2)
@@ -189,7 +189,7 @@ func TestPieceVerifier_MultiFile_RightBoundarySkipped(t *testing.T) {
 	info, offsets, _ := buildTestTorrent(t, pieceLen, []testFile{{"a", file1}, {"b", file2}})
 
 	v := newPieceVerifier(info, offsets[0], int64(len(file1)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), file1); err != nil {
@@ -203,7 +203,7 @@ func TestPieceVerifier_PieceLargerThanFile_Skipped(t *testing.T) {
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", tiny}})
 
 	v := newPieceVerifier(info, 0, int64(len(tiny)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), tiny); err != nil {
@@ -226,7 +226,7 @@ func TestPieceVerifier_MultiFile_PieceSpansThreeFiles(t *testing.T) {
 	}
 
 	v := newPieceVerifier(info, offsets[2], int64(len(c)), prev, fakeFetcher(store))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), c); err != nil {
@@ -234,44 +234,60 @@ func TestPieceVerifier_MultiFile_PieceSpansThreeFiles(t *testing.T) {
 	}
 }
 
-func TestPieceVerifier_Resume_SelfFetch(t *testing.T) {
+func TestPieceVerifier_Resume_SkipsResumePiece_Clean(t *testing.T) {
 	const pieceLen = 100
 	bytes := append(append(fillPattern('A', pieceLen), fillPattern('B', pieceLen)...), fillPattern('C', pieceLen)...)
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
 
-	selfHash := "self"
-	store := map[string][]byte{selfHash: bytes}
-	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(store))
+	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(nil))
+	const resumeFrom = int64(150) // mid piece 1 — verifier must skip piece 1
 
-	const resumeFrom = int64(150) // mid piece 1
-	if err := v.Bootstrap(context.Background(), selfHash, resumeFrom); err != nil {
+	if err := v.Bootstrap(context.Background(), resumeFrom); err != nil {
 		t.Fatalf("Bootstrap resume: %v", err)
 	}
-	// Feed remaining bytes (piece 1 second half + piece 2)
+	// Feed remaining bytes from the resume offset onwards. Piece 1 is
+	// skipped (we cannot read in-flight multipart bytes back). Piece 2
+	// is hashed and verified normally.
 	if err := v.Feed(context.Background(), bytes[resumeFrom:]); err != nil {
 		t.Fatalf("Feed: %v", err)
 	}
 }
 
-func TestPieceVerifier_Resume_SelfCorrupt(t *testing.T) {
+func TestPieceVerifier_Resume_DetectsCorruptionInLaterPiece(t *testing.T) {
 	const pieceLen = 100
 	bytes := append(append(fillPattern('A', pieceLen), fillPattern('B', pieceLen)...), fillPattern('C', pieceLen)...)
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
 
 	corrupt := make([]byte, len(bytes))
 	copy(corrupt, bytes)
-	corrupt[10] ^= 0xFF // flip inside piece 0 (already uploaded "to S3")
+	corrupt[210] ^= 0xFF // flip inside piece 2 (post-resume, must be caught inline)
 
-	selfHash := "self"
-	store := map[string][]byte{selfHash: corrupt}
-	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(store))
-
-	err := v.Bootstrap(context.Background(), selfHash, int64(pieceLen))
-	if err == nil {
-		t.Fatal("expected resume to detect piece 0 mismatch, got nil")
+	v := newPieceVerifier(info, 0, int64(len(corrupt)), nil, fakeFetcher(nil))
+	if err := v.Bootstrap(context.Background(), int64(pieceLen)); err != nil {
+		t.Fatalf("Bootstrap resume: %v", err)
 	}
-	if !strings.Contains(err.Error(), "piece 0 sha1 mismatch") {
-		t.Fatalf("expected piece 0 mismatch, got %v", err)
+	err := v.Feed(context.Background(), corrupt[pieceLen:])
+	if err == nil {
+		t.Fatal("expected piece 2 mismatch on resumed feed, got nil")
+	}
+	if !strings.Contains(err.Error(), "piece 2 sha1 mismatch") {
+		t.Fatalf("expected piece 2 mismatch, got %v", err)
+	}
+}
+
+func TestPieceVerifier_Resume_PieceAligned(t *testing.T) {
+	const pieceLen = 100
+	bytes := append(append(fillPattern('A', pieceLen), fillPattern('B', pieceLen)...), fillPattern('C', pieceLen)...)
+	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
+
+	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(nil))
+	// Resume exactly on a piece boundary — pieces 1 and 2 are hashed
+	// normally because no piece is mid-flight.
+	if err := v.Bootstrap(context.Background(), int64(pieceLen)); err != nil {
+		t.Fatalf("Bootstrap resume: %v", err)
+	}
+	if err := v.Feed(context.Background(), bytes[pieceLen:]); err != nil {
+		t.Fatalf("Feed: %v", err)
 	}
 }
 
@@ -281,7 +297,7 @@ func TestPieceVerifier_FedInChunks(t *testing.T) {
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"f", bytes}})
 
 	v := newPieceVerifier(info, 0, int64(len(bytes)), nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	// Feed in 17-byte chunks to exercise piece-boundary handling across calls.
@@ -301,7 +317,7 @@ func TestPieceVerifier_ZeroByteFile(t *testing.T) {
 	info, _, _ := buildTestTorrent(t, pieceLen, []testFile{{"a", fillPattern('A', 100)}, {"b", nil}})
 	// Verify file b (zero-byte) — Bootstrap and Feed should both noop.
 	v := newPieceVerifier(info, 100, 0, nil, fakeFetcher(nil))
-	if err := v.Bootstrap(context.Background(), "", 0); err != nil {
+	if err := v.Bootstrap(context.Background(), 0); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 	if err := v.Feed(context.Background(), nil); err != nil {

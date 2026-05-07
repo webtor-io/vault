@@ -89,25 +89,24 @@ func newPieceVerifier(mi *metainfo.Info, fileOff, fileLen int64, prev []prevFile
 	}
 }
 
-// Bootstrap initializes hashing for the first piece and, if the upload is
-// resuming, walks already-uploaded bytes back through the verifier so the
-// in-progress piece state matches the actual S3 contents.
-//
-// selfHash is this file's content hash — only consulted when resumeFrom > 0.
-func (v *pieceVerifier) Bootstrap(ctx context.Context, selfHash string, resumeFrom int64) error {
+// Bootstrap initializes hashing for the first piece that the upload stream
+// will produce. When the upload is resuming (resumeFrom > 0), the piece
+// overlapping that offset is left unhashed: the bytes we'd need to seed
+// the hasher live in an in-flight multipart upload, which S3 GetObject
+// can't read back until CompleteMultipartUpload finalises the object.
+// All pieces strictly after the resume point are hashed normally as they
+// flow through Feed.
+func (v *pieceVerifier) Bootstrap(ctx context.Context, resumeFrom int64) error {
 	if v.fileLen == 0 {
 		return nil
 	}
-	v.curPiece = int(v.fileOff / v.pieceLen)
-	if err := v.beginPiece(ctx); err != nil {
-		return err
-	}
+	v.bytesSeen = resumeFrom
+	v.curPiece = int((v.fileOff + resumeFrom) / v.pieceLen)
 	if resumeFrom > 0 {
-		if err := v.feedFromFetcher(ctx, selfHash, 0, resumeFrom); err != nil {
-			return errors.Wrap(err, "verifier resume self-fetch")
-		}
+		v.curHash = nil
+		return nil
 	}
-	return nil
+	return v.beginPiece(ctx)
 }
 
 // Feed consumes len(p) bytes that are about to be uploaded to S3. It returns
@@ -219,31 +218,6 @@ func (v *pieceVerifier) prevFileAt(off int64) *prevFileInfo {
 		if off >= f.torrentOff && off < f.torrentOff+f.length {
 			return f
 		}
-	}
-	return nil
-}
-
-// feedFromFetcher pulls [startInFile, endInFile) of THIS file from its S3
-// object and feeds the bytes through Feed. Used during resume to replay
-// already-uploaded bytes into the in-progress hasher.
-func (v *pieceVerifier) feedFromFetcher(ctx context.Context, selfHash string, startInFile, endInFile int64) error {
-	const chunk = int64(4 * 1024 * 1024)
-	for off := startInFile; off < endInFile; {
-		end := off + chunk
-		if end > endInFile {
-			end = endInFile
-		}
-		data, err := v.fetch(ctx, selfHash, off, end)
-		if err != nil {
-			return err
-		}
-		if int64(len(data)) != end-off {
-			return errors.Errorf("self-fetch %s [%d, %d) returned %d bytes", selfHash, off, end, len(data))
-		}
-		if err := v.Feed(ctx, data); err != nil {
-			return err
-		}
-		off = end
 	}
 	return nil
 }

@@ -1263,7 +1263,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			return nil, errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
 		}
 		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket))
-		if err := verifier.Bootstrap(ctx, hash, stored); err != nil {
+		if err := verifier.Bootstrap(ctx, stored); err != nil {
 			// Bootstrap pulls already-uploaded bytes through the hasher;
 			// failure means the resume prefix is corrupt (or prev files
 			// can't be read). Abort the multipart upload and reset the
