@@ -72,14 +72,27 @@ func (s *Web) webSeed(c *gin.Context) {
 
 	if c.Request.Method == http.MethodHead {
 		s.handleHeadRequest(c, hash)
-	} else {
-		presignedURL, err := s.presignGetObject(hash)
-		if err != nil {
-			_ = c.Error(err)
-			return
-		}
-		c.Redirect(http.StatusFound, presignedURL)
+		return
 	}
+
+	// When s3-cache is wired in, route through it: stable URL (no presigned signature),
+	// multi-range + chunk caching handled there. Falls back to direct presigned S3
+	// when the env-flag is empty — keeps rollback a single env unset.
+	//
+	// s3-cache is single-tenant — the bucket is fixed on its side via AWS_BUCKET,
+	// so the URL carries only the object key. Both deploys must point at the same
+	// bucket or this silently serves wrong data.
+	if s.s3CacheURL != "" {
+		c.Redirect(http.StatusFound, s.s3CacheURL+"/"+hash)
+		return
+	}
+
+	presignedURL, err := s.presignGetObject(hash)
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.Redirect(http.StatusFound, presignedURL)
 }
 
 func (s *Web) handleHeadRequest(c *gin.Context, hash string) {

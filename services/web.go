@@ -33,8 +33,9 @@ var (
 // @contact.email  support@webtor.io
 
 const (
-	webHostFlag = "host"
-	webPortFlag = "port"
+	webHostFlag     = "host"
+	webPortFlag     = "port"
+	s3CacheURLFlag  = "s3-cache-url"
 )
 
 func RegisterWebFlags(f []cli.Flag) []cli.Flag {
@@ -51,6 +52,14 @@ func RegisterWebFlags(f []cli.Flag) []cli.Flag {
 			Value:  8080,
 			EnvVar: "WEB_PORT",
 		},
+		cli.StringFlag{
+			Name: s3CacheURLFlag,
+			Usage: "base URL of s3-cache (e.g. http://s3-cache:80); " +
+				"when set, /webseed redirects clients here instead of presigned S3. " +
+				"Empty disables — falls back to direct S3 presigned URL.",
+			Value:  "",
+			EnvVar: "S3_CACHE_URL",
+		},
 	)
 }
 
@@ -62,15 +71,18 @@ type Web struct {
 	s3   *cs.S3Client
 	// bucket to read objects from (same as worker's AWS_BUCKET)
 	bucket string
+	// s3CacheURL — when set, webseed redirects here instead of OVH directly.
+	s3CacheURL string
 }
 
 func NewWeb(c *cli.Context, pg *cs.PG, s3 *cs.S3Client) *Web {
 	return &Web{
-		host:   c.String(webHostFlag),
-		port:   c.Int(webPortFlag),
-		pg:     pg,
-		s3:     s3,
-		bucket: c.String("aws-bucket"),
+		host:       c.String(webHostFlag),
+		port:       c.Int(webPortFlag),
+		pg:         pg,
+		s3:         s3,
+		bucket:     c.String("aws-bucket"),
+		s3CacheURL: c.String(s3CacheURLFlag),
 	}
 }
 
