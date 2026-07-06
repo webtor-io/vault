@@ -108,8 +108,20 @@ func (s *Web) handleHeadRequest(c *gin.Context, hash string) {
 	if out.ContentLength != nil {
 		c.Header("Content-Length", fmt.Sprintf("%d", *out.ContentLength))
 	}
-	if out.ContentType != nil {
-		c.Header("Content-Type", *out.ContentType)
+	// Content-Type is normalized and ETag/Last-Modified are exposed to match
+	// what s3-cache emits on GET: players key stream-resume on these
+	// validators, and vault uploads carry S3's default "binary/octet-stream"
+	// which is not a registered MIME type.
+	ct := "application/octet-stream"
+	if out.ContentType != nil && *out.ContentType != "" && *out.ContentType != "binary/octet-stream" {
+		ct = *out.ContentType
+	}
+	c.Header("Content-Type", ct)
+	if out.ETag != nil {
+		c.Header("ETag", *out.ETag)
+	}
+	if out.LastModified != nil {
+		c.Header("Last-Modified", out.LastModified.UTC().Format(http.TimeFormat))
 	}
 	c.Header("Accept-Ranges", "bytes")
 	c.Status(http.StatusOK)
