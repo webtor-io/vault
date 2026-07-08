@@ -87,12 +87,23 @@ func (s *Web) webSeed(c *gin.Context) {
 		return
 	}
 
-	presignedURL, err := s.presignGetObject(hash)
+	presignedURL, err := s.presignGetObject(c.Request.Context(), hash)
 	if err != nil {
 		_ = c.Error(err)
 		return
 	}
 	c.Redirect(http.StatusFound, presignedURL)
+}
+
+// normalizeContentType maps S3's default "binary/octet-stream" (not a
+// registered MIME type; legacy vault uploads carry it) to a valid one.
+// New uploads store a real Content-Type (see worker.contentTypeForPath),
+// so this is a legacy-object fallback.
+func normalizeContentType(ct *string) string {
+	if ct != nil && *ct != "" && *ct != "binary/octet-stream" {
+		return *ct
+	}
+	return "application/octet-stream"
 }
 
 func (s *Web) handleHeadRequest(c *gin.Context, hash string) {
@@ -110,13 +121,8 @@ func (s *Web) handleHeadRequest(c *gin.Context, hash string) {
 	}
 	// Content-Type is normalized and ETag/Last-Modified are exposed to match
 	// what s3-cache emits on GET: players key stream-resume on these
-	// validators, and vault uploads carry S3's default "binary/octet-stream"
-	// which is not a registered MIME type.
-	ct := "application/octet-stream"
-	if out.ContentType != nil && *out.ContentType != "" && *out.ContentType != "binary/octet-stream" {
-		ct = *out.ContentType
-	}
-	c.Header("Content-Type", ct)
+	// validators.
+	c.Header("Content-Type", normalizeContentType(out.ContentType))
 	if out.ETag != nil {
 		c.Header("ETag", *out.ETag)
 	}
@@ -163,11 +169,23 @@ func (s *Web) lookupStoredFileHash(ctx context.Context, db *pg.DB, id, path stri
 	return rf.FileHash, true, nil
 }
 
-func (s *Web) presignGetObject(hash string) (string, error) {
+func (s *Web) presignGetObject(ctx context.Context, hash string) (string, error) {
 	s3cl := s.s3.Get()
-	req, _ := s3cl.GetObjectRequest(&awss3.GetObjectInput{
+	// ResponseContentType keeps the raw-S3 fallback consistent with the
+	// normalized HEAD above — without it, rolling back s3-cache (unsetting
+	// S3_CACHE_URL) would resurface the HEAD/GET Content-Type mismatch that
+	// confuses stream-resume in players.
+	head, err := s3cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(hash),
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to head object for presign")
+	}
+	req, _ := s3cl.GetObjectRequest(&awss3.GetObjectInput{
+		Bucket:              aws.String(s.bucket),
+		Key:                 aws.String(hash),
+		ResponseContentType: aws.String(normalizeContentType(head.ContentType)),
 	})
 	return req.Presign(presignTTL)
 }

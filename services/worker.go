@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -1149,9 +1151,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			}
 		}
 		_, err := s3Cl.PutObjectWithContext(ctx, &awss3.PutObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(hash),
-			Body:   bytes.NewReader(nil),
+			Bucket:      aws.String(s.bucket),
+			Key:         aws.String(hash),
+			Body:        bytes.NewReader(nil),
+			ContentType: aws.String(contentTypeForPath(item.PathStr)),
 		})
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to put zero-byte object, bucket=%s, key=%s", s.bucket, hash)
@@ -1181,8 +1184,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 
 	if f.UploadID == "" {
 		out, err := s3Cl.CreateMultipartUploadWithContext(ctx, &awss3.CreateMultipartUploadInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(hash),
+			Bucket:      aws.String(s.bucket),
+			Key:         aws.String(hash),
+			ContentType: aws.String(contentTypeForPath(item.PathStr)),
 		})
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create S3 multipart upload, bucket=%s, key=%s", s.bucket, hash)
@@ -1219,8 +1223,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NoSuchUpload" {
 			// Upload expired or deleted, restart
 			out, err := s3Cl.CreateMultipartUploadWithContext(ctx, &awss3.CreateMultipartUploadInput{
-				Bucket: aws.String(s.bucket),
-				Key:    aws.String(hash),
+				Bucket:      aws.String(s.bucket),
+				Key:         aws.String(hash),
+				ContentType: aws.String(contentTypeForPath(item.PathStr)),
 			})
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to recreate S3 multipart upload after NoSuchUpload, bucket=%s, key=%s", s.bucket, hash)
@@ -1502,6 +1507,19 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// that previously existed between this point and the transaction.
 	log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": item.Size}).Info("stored to s3")
 	return f, nil
+}
+
+// contentTypeForPath resolves the stored Content-Type from the file
+// extension. Without it S3 records its default "binary/octet-stream" — not
+// a registered MIME type — which every serving path (s3-cache, webseed
+// HEAD, tws passthrough) then has to normalize away; setting it here fixes
+// new objects at the root. Legacy objects keep the read-side normalization
+// as a fallback.
+func contentTypeForPath(path string) string {
+	if ct := mime.TypeByExtension(filepath.Ext(path)); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
 }
 
 func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.ExportResponse) (string, error) {
