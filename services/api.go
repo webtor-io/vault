@@ -31,6 +31,7 @@ const (
 	useInternalTorrentHTTPProxyFlag = "use-internal-torrent-http-proxy"
 	torrentHTTPProxyHostFlag        = "torrent-http-proxy-host"
 	torrentHTTPProxyPortFlag        = "torrent-http-proxy-port"
+	torrentHTTPProxyPathPrefixFlag  = "torrent-http-proxy-path-prefix"
 )
 
 func RegisterApiFlags(f []cli.Flag) []cli.Flag {
@@ -85,6 +86,11 @@ func RegisterApiFlags(f []cli.Flag) []cli.Flag {
 			EnvVar: "TORRENT_HTTP_PROXY_SERVICE_PORT",
 			Value:  80,
 		},
+		cli.StringFlag{
+			Name:   torrentHTTPProxyPathPrefixFlag,
+			Usage:  "path prefix to strip when talking to torrent-http-proxy directly (its own router has no notion of the prefix an edge nginx uses to route to it by path instead of by subdomain)",
+			EnvVar: "TORRENT_HTTP_PROXY_PATH_PREFIX",
+		},
 	)
 }
 
@@ -105,6 +111,7 @@ type Api struct {
 	useInternalTorrentHTTPProxy bool
 	torrentHTTPProxyHost        string
 	torrentHTTPProxyPort        int
+	torrentHTTPProxyPathPrefix  string
 }
 
 type ListResourceContentOutputType string
@@ -173,6 +180,7 @@ func NewApi(c *cli.Context, cl *http.Client) *Api {
 		useInternalTorrentHTTPProxy: c.Bool(useInternalTorrentHTTPProxyFlag),
 		torrentHTTPProxyHost:        c.String(torrentHTTPProxyHostFlag),
 		torrentHTTPProxyPort:        c.Int(torrentHTTPProxyPortFlag),
+		torrentHTTPProxyPathPrefix:  c.String(torrentHTTPProxyPathPrefixFlag),
 	}
 }
 
@@ -258,6 +266,23 @@ func (s *Api) Download(ctx context.Context, u string) (io.ReadCloser, error) {
 	return s.DownloadWithRange(ctx, u, 0, -1)
 }
 
+// makeTorrentHTTPProxyRequest rewrites u to hit torrent-http-proxy directly
+// when useInternalTorrentHTTPProxy is set, instead of the external host
+// (typically an edge nginx) baked into the export URL rest-api handed out.
+//
+// An edge that fronts multiple services on one hostname (self-hosted's
+// nginx does, since every service shares port 8080) commonly routes to
+// torrent-http-proxy by path prefix rather than by subdomain, and strips
+// that prefix before proxying. rest-api bakes the external-facing prefix
+// into every export URL it builds (its own EXPORT_PATH_PREFIX), because it
+// has no way to know the request will end up going straight to
+// torrent-http-proxy instead of through that edge. torrent-http-proxy's own
+// router has no notion of the prefix -- it expects the infohash as the
+// first path segment -- so going internal must also strip it here, or
+// every internal request 404s/500s on a path torrent-http-proxy cannot
+// parse while looking, from the outside, exactly like a working torrent
+// fetch (see FetchTorrent's comment for the failure this produced before
+// path stripping existed).
 func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.Request, error) {
 	if s.useInternalTorrentHTTPProxy {
 		internal := fmt.Sprintf("%v:%v", s.torrentHTTPProxyHost, s.torrentHTTPProxyPort)
@@ -267,26 +292,40 @@ func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.
 		}
 		ur.Host = internal
 		ur.Scheme = "http"
+		if s.torrentHTTPProxyPathPrefix != "" {
+			prefix := "/" + strings.Trim(s.torrentHTTPProxyPathPrefix, "/") + "/"
+			if strings.HasPrefix(ur.Path, prefix) {
+				ur.Path = "/" + strings.TrimPrefix(ur.Path, prefix)
+			}
+		}
 		u = ur.String()
 	}
 	return http.NewRequestWithContext(ctx, "GET", u, nil)
 }
 
-// FetchTorrent retrieves the bencode .torrent for the resource hosted at the
-// seeder behind the given export URL. It reuses the auth tokens already
-// embedded in the export URL by replacing only the file-path component with
-// "/source.torrent" — the seeder serves the torrent at that route via
-// renderTorrent (see torrent-web-seeder/server/services/web_seeder.go).
-func (s *Api) FetchTorrent(ctx context.Context, exportURL string) ([]byte, error) {
+// FetchTorrent retrieves the bencode .torrent for the given resource,
+// hosted at the seeder behind the given export URL. It reuses the auth
+// tokens already embedded in the export URL by replacing the whole path
+// with "/{infohash}/source.torrent" — the seeder serves the torrent at that
+// route via renderTorrent (see
+// torrent-web-seeder/server/services/web_seeder.go).
+//
+// infohash is passed in explicitly rather than read off exportURL's first
+// path segment: rest-api's EXPORT_PATH_PREFIX (self-hosted sets it to
+// "/torrent-http-proxy/" so its single nginx can route exported URLs to
+// torrent-http-proxy by path instead of by subdomain) shifts the infohash to
+// a later segment, and parsing the URL blind produced "torrent-http-proxy"
+// as the "infohash" and a 404/500 loop that left every pledge stuck at
+// vaulted=false with no error surfaced to the caller.
+func (s *Api) FetchTorrent(ctx context.Context, exportURL string, infohash string) ([]byte, error) {
+	if infohash == "" {
+		return nil, errors.New("empty infohash")
+	}
 	u, err := url.Parse(exportURL)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to parse export URL")
 	}
-	parts := strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 2)
-	if len(parts) < 1 || parts[0] == "" {
-		return nil, errors.Errorf("unexpected export URL path %q", u.Path)
-	}
-	u.Path = "/" + parts[0] + "/source.torrent"
+	u.Path = "/" + infohash + "/source.torrent"
 
 	req, err := s.makeTorrentHTTPProxyRequest(ctx, u.String())
 	if err != nil {

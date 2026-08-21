@@ -556,7 +556,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		if err != nil {
 			return errors.Wrap(err, "failed to export resource content for torrent fetch")
 		}
-		raw, err := s.api.FetchTorrent(ctx, ei.ExportItems["download"].URL)
+		raw, err := s.api.FetchTorrent(ctx, ei.ExportItems["download"].URL, id)
 		if err != nil {
 			return errors.Wrap(err, "failed to fetch torrent for verification")
 		}

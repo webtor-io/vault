@@ -244,7 +244,7 @@ func fetchMetainfoForResource(ctx context.Context, api *Api, cla *Claims, resour
 	if err != nil {
 		return nil, errors.Wrap(err, "export resource content")
 	}
-	raw, err := api.FetchTorrent(ctx, ei.ExportItems["download"].URL)
+	raw, err := api.FetchTorrent(ctx, ei.ExportItems["download"].URL, resourceID)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetch torrent")
 	}
