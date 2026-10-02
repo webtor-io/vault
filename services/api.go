@@ -288,7 +288,8 @@ func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.
 		internal := fmt.Sprintf("%v:%v", s.torrentHTTPProxyHost, s.torrentHTTPProxyPort)
 		ur, err := url.Parse(u)
 		if err != nil {
-			return nil, err
+			// *url.Error quotes u, credentials included.
+			return nil, redactError(err)
 		}
 		ur.Host = internal
 		ur.Scheme = "http"
@@ -300,7 +301,11 @@ func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.
 		}
 		u = ur.String()
 	}
-	return http.NewRequestWithContext(ctx, "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, redactError(err)
+	}
+	return req, nil
 }
 
 // FetchTorrent retrieves the bencode .torrent for the given resource,
@@ -323,7 +328,7 @@ func (s *Api) FetchTorrent(ctx context.Context, exportURL string, infohash strin
 	}
 	u, err := url.Parse(exportURL)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse export URL")
+		return nil, errors.Wrap(redactError(err), "failed to parse export URL")
 	}
 	u.Path = "/" + infohash + "/source.torrent"
 
@@ -333,11 +338,11 @@ func (s *Api) FetchTorrent(ctx context.Context, exportURL string, infohash strin
 	}
 	res, err := s.cl.Do(req)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to fetch torrent")
+		return nil, errors.Wrap(redactError(err), "failed to fetch torrent")
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("unexpected status %d fetching torrent from %s", res.StatusCode, u.String())
+		return nil, errors.Errorf("unexpected status %d fetching torrent from %s", res.StatusCode, redactURL(u.String()))
 	}
 	return io.ReadAll(res.Body)
 }
@@ -357,18 +362,19 @@ func (s *Api) DownloadWithRange(ctx context.Context, u string, start int, end in
 		req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", startStr, endStr))
 	}
 	log.WithFields(log.Fields{
-		"url":   req.URL.String(),
+		"url":   redactURL(req.URL.String()),
 		"start": start,
 		"end":   end,
 	}).Info("downloading with range")
 	res, err := s.cl.Do(req)
 	if err != nil {
+		err = redactError(err)
 		log.WithError(err).Error("failed to do request")
 		return nil, err
 	}
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
 		_ = res.Body.Close()
-		return nil, errors.Errorf("unexpected status %d downloading url=%s", res.StatusCode, req.URL.String())
+		return nil, errors.Errorf("unexpected status %d downloading url=%s", res.StatusCode, redactURL(req.URL.String()))
 	}
 	return res.Body, nil
 }
