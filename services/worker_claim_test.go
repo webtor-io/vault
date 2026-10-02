@@ -185,3 +185,19 @@ func TestReleasePodLeases(t *testing.T) {
 		t.Errorf("general claimed %q after pod-a stopped, want \"general\" (pod-b's lease is live)", got)
 	}
 }
+
+// A job a stopped pod cut short goes before retries: it was running, not
+// failing.
+func TestTryClaimInterruptedBeforeRetries(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.Exec(`INSERT INTO resource (resource_id, status, updated_at) VALUES ('retry', 3, now() - interval '2 hours')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO resource (resource_id, status, claimed_by) VALUES ('interrupted', 1, 'pod-a#3')`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := (&Worker{}).tryClaim(context.Background(), db, "pod-c#0", false)
+	if err != nil || res == nil || res.ID != "interrupted" {
+		t.Errorf("first claim = %+v (%v), want the interrupted job", res, err)
+	}
+}

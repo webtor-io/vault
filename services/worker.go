@@ -17,6 +17,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/request"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	pg "github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
@@ -254,6 +255,11 @@ func (s *Worker) claimLoop(workerID string, freshOnly bool) {
 // same UPDATE, so there is no intermediate "just claimed, not yet started"
 // state visible to other workers.
 //
+// Order: new work, then jobs a stopped pod or a crash cut short (they were
+// running, not failing, and resume where they stopped), then retries;
+// oldest first within each. Cut-short jobs used to queue behind every
+// retry past its backoff -- an hour after a rollout (2026-10-03).
+//
 // freshOnly (the FRESH_WORKERS loops) narrows eligibility to new work:
 // queued rows, and a first attempt a fresh loop was running when its pod
 // stopped or died -- storing/deleting with the lease gone and claimed_by
@@ -285,7 +291,7 @@ func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string, fresh
 		  )
 		  %s
 		ORDER BY
-		  CASE WHEN status IN (%d, %d) THEN 0 ELSE 1 END,
+		  CASE WHEN status IN (%d, %d) THEN 0 WHEN status IN (%d, %d) THEN 1 ELSE 2 END,
 		  updated_at ASC
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
@@ -293,6 +299,7 @@ func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string, fresh
 		eligible,
 		s.debugResourceIDClause(),
 		StatusQueuedForStoring, StatusQueuedForDeletion,
+		StatusStoring, StatusDeleting,
 	)
 
 	stmt := fmt.Sprintf(`
@@ -1377,7 +1384,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 						UploadId:   aws.String(f.UploadID),
 						PartNumber: aws.Int64(pj.partNumber),
 						Body:       bytes.NewReader(pj.data),
-					})
+					}, unsignedOverTLS)
 					if err == nil {
 						break
 					}
@@ -1578,6 +1585,21 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// that previously existed between this point and the transaction.
 	log.WithFields(log.Fields{"bucket": s.bucket, "resource_id": id, "path": item.PathStr, "key": hash, "size": item.Size}).Info("stored to s3")
 	return f, nil
+}
+
+// unsignedOverTLS skips the two hashes aws-sdk-go computes over every part
+// body -- SHA-256 for the signature, MD5 for Content-MD5: 47% of a busy
+// pod's CPU, which held it at its limit (2026-10-03). Over TLS they add
+// nothing: the transport protects the bytes, and with integrity
+// verification on each part was checked against the torrent's piece SHA-1s
+// before upload. Over plain HTTP the signature is all that protects the
+// body, so it stays.
+func unsignedOverTLS(r *request.Request) {
+	if r.HTTPRequest.URL.Scheme != "https" {
+		return
+	}
+	r.Config.S3DisableContentMD5Validation = aws.Bool(true)
+	r.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 }
 
 // contentTypeForPath resolves the stored Content-Type from the file
