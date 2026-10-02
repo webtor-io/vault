@@ -246,9 +246,11 @@ func (s *Api) doRequest(ctx context.Context, c *Claims, url string, method strin
 		var e ra.ErrorResponse
 		err = json.Unmarshal(body, &e)
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse status=%v body=%v url=%v", res.StatusCode, body, url)
+			// %s, not %v: a []byte prints as numbers, past redactURL.
+			return redactError(errors.Wrapf(err, "failed to parse status=%v body=%s url=%v", res.StatusCode, body, url))
 		}
-		return errors.New(e.Error)
+		// rest-api's error text can quote an export URL it built.
+		return redactError(errors.New(e.Error))
 	}
 }
 

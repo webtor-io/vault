@@ -231,3 +231,22 @@ func TestFetchTorrentKeepsNoCredentials(t *testing.T) {
 		})
 	}
 }
+
+// rest-api's own error texts can quote an export URL it built.
+func TestRestAPIErrorsKeepNoCredentials(t *testing.T) {
+	for _, body := range []string{
+		`{"error":"failed to build url=https://node.example/h/f.mkv?api-key=APIKEY1&token=TOKEN1"}`,
+		`not json url=https://node.example/h/f.mkv?api-key=APIKEY1&token=TOKEN1`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(body))
+		}))
+		a := &Api{url: srv.URL, cl: srv.Client(), prepareRequest: func(r *http.Request, _ *Claims) (*http.Request, error) { return r, nil }}
+		_, err := a.ExportResourceContent(context.Background(), &Claims{}, "h", "i")
+		srv.Close()
+		if err == nil || strings.Contains(err.Error(), "APIKEY1") || strings.Contains(err.Error(), "TOKEN1") {
+			t.Errorf("body %q: error must be redacted, got %v", body, err)
+		}
+	}
+}
