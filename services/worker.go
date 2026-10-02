@@ -51,6 +51,7 @@ type Worker struct {
 	pg              *cs.PG
 	s3              *cs.S3Client
 	nwrks           int
+	nfresh          int
 	api             *Api
 	bucket          string
 	concur          int
@@ -64,6 +65,7 @@ type Worker struct {
 
 const (
 	workerCountFlag          = "workers"
+	freshWorkerCountFlag     = "fresh-workers"
 	awsBucketFlag            = "aws-bucket"
 	awsUploadConcurrencyFlag = "aws-upload-concurrency"
 	awsUploadPartSizeFlag    = "aws-upload-part-size"
@@ -79,6 +81,11 @@ func RegisterWorkerFlags(f []cli.Flag) []cli.Flag {
 			Usage:  "number of worker goroutines",
 			Value:  10,
 			EnvVar: "WORKERS",
+		},
+		cli.IntFlag{
+			Name:   freshWorkerCountFlag,
+			Usage:  "extra claim loops that take only new work (a first store or delete attempt), so it does not wait behind retries",
+			EnvVar: "FRESH_WORKERS",
 		},
 		cli.StringFlag{
 			Name:   awsBucketFlag,
@@ -127,6 +134,7 @@ func NewWorker(c *cli.Context, pgc *cs.PG, s3 *cs.S3Client, api *Api, nt *cs.NAT
 		pg:              pgc,
 		s3:              s3,
 		nwrks:           c.Int(workerCountFlag),
+		nfresh:          c.Int(freshWorkerCountFlag),
 		api:             api,
 		bucket:          c.String(awsBucketFlag),
 		concur:          c.Int(awsUploadConcurrencyFlag),
@@ -154,7 +162,7 @@ func (s *Worker) Serve() error {
 		log.WithField("resource_id", s.resourceID).
 			Info("Worker started in debug mode for specific resource")
 		workerID := s.workerBase + "#debug"
-		res, err := s.tryClaim(s.ctx, db, workerID)
+		res, err := s.tryClaim(s.ctx, db, workerID, false)
 		if err != nil {
 			return errors.Wrap(err, "debug claim failed")
 		}
@@ -166,11 +174,22 @@ func (s *Worker) Serve() error {
 		<-s.ctx.Done()
 		return nil
 	}
-	log.WithField("workers", s.nwrks).Info("Worker started")
+	if s.nfresh < 0 {
+		return errors.Errorf("%s must not be negative, got %d", freshWorkerCountFlag, s.nfresh)
+	}
+	log.WithField("workers", s.nwrks).WithField("fresh_workers", s.nfresh).Info("Worker started")
 	for i := 0; i < s.nwrks; i++ {
 		s.wg.Add(1)
 		workerID := fmt.Sprintf("%s#%d", s.workerBase, i)
-		go s.claimLoop(workerID)
+		go s.claimLoop(workerID, false)
+	}
+	// Every general loop can be held for hours by a retry, and a new pledge
+	// waited for one to free up (p50 ~2 min, p90 6-10 min, 2026-10-02).
+	// Fresh loops ("#f<i>") keep that capacity for new work only.
+	for i := 0; i < s.nfresh; i++ {
+		s.wg.Add(1)
+		workerID := fmt.Sprintf("%s#f%d", s.workerBase, i)
+		go s.claimLoop(workerID, true)
 	}
 	<-s.ctx.Done()
 	log.Info("Worker stopped")
@@ -184,7 +203,7 @@ func (s *Worker) Serve() error {
 // other goroutines (inside this pod or across pods) is the atomic CAS in
 // tryClaim, which is safe because it is a single UPDATE ... RETURNING in
 // the database.
-func (s *Worker) claimLoop(workerID string) {
+func (s *Worker) claimLoop(workerID string, freshOnly bool) {
 	defer s.wg.Done()
 	db := s.pg.Get()
 	for {
@@ -193,7 +212,7 @@ func (s *Worker) claimLoop(workerID string) {
 			return
 		default:
 		}
-		res, err := s.tryClaim(s.ctx, db, workerID)
+		res, err := s.tryClaim(s.ctx, db, workerID, freshOnly)
 		if err != nil {
 			log.WithError(err).WithField("worker", workerID).Warn("claim failed")
 			// back off a bit on transient DB errors
@@ -234,17 +253,35 @@ func (s *Worker) claimLoop(workerID string) {
 // The status is flipped to the corresponding processing status in the
 // same UPDATE, so there is no intermediate "just claimed, not yet started"
 // state visible to other workers.
-func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string) (*Resource, error) {
+//
+// freshOnly (the FRESH_WORKERS loops) narrows eligibility to new work:
+// queued rows, and a first attempt a fresh loop was running when its pod
+// stopped or died -- storing/deleting with the lease gone and claimed_by
+// still naming a fresh loop (Close keeps it). Retries stay with the
+// general loops.
+func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string, freshOnly bool) (*Resource, error) {
 	var res Resource
+	eligible := fmt.Sprintf(`status IN (%d, %d)
+		    OR (status IN (%d, %d))
+		    OR (status IN (%d, %d) AND now() - updated_at > interval '%d seconds')`,
+		StatusQueuedForStoring, StatusQueuedForDeletion,
+		StatusStoring, StatusDeleting,
+		StatusStoreError, StatusDeleteError, int(storeErrorBackoff.Seconds()),
+	)
+	if freshOnly {
+		eligible = fmt.Sprintf(`status IN (%d, %d)
+		    OR (status IN (%d, %d) AND claimed_by LIKE '%%#f%%')`,
+			StatusQueuedForStoring, StatusQueuedForDeletion,
+			StatusStoring, StatusDeleting,
+		)
+	}
 	// The subquery picks one eligible row, and the outer UPDATE takes the
 	// lease and flips status. RETURNING gives us the full updated row.
 	subquery := fmt.Sprintf(`
 		SELECT resource_id FROM resource
 		WHERE (claim_expires_at IS NULL OR claim_expires_at < now())
 		  AND (
-		    status IN (%d, %d)
-		    OR (status IN (%d, %d))
-		    OR (status IN (%d, %d) AND now() - updated_at > interval '%d seconds')
+		    %s
 		  )
 		  %s
 		ORDER BY
@@ -253,9 +290,7 @@ func (s *Worker) tryClaim(ctx context.Context, db *pg.DB, workerID string) (*Res
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`,
-		StatusQueuedForStoring, StatusQueuedForDeletion,
-		StatusStoring, StatusDeleting,
-		StatusStoreError, StatusDeleteError, int(storeErrorBackoff.Seconds()),
+		eligible,
 		s.debugResourceIDClause(),
 		StatusQueuedForStoring, StatusQueuedForDeletion,
 	)
@@ -329,14 +364,24 @@ func (s *Worker) processClaimed(parentCtx context.Context, db *pg.DB, res *Resou
 		log.WithError(logErr).WithField("resource_id", res.ID).Warn("failed to create worker log")
 	}
 
+	// A shutdown is not a failure: Close hands the lease back and another
+	// pod resumes the job at once (multipart resume). Recorded as
+	// store_error it sat out storeErrorBackoff instead -- every job in
+	// flight on every rollout (40 on 2026-09-27).
+	interrupted := func() bool { return parentCtx.Err() != nil }
+
 	var handlerErr error
 	switch res.Status {
 	case StatusStoring:
 		log.WithField("id", res.ID).Info("storing started")
-		handlerErr = s.handleStore(ctx, db, res.ID)
-		if handlerErr != nil {
+		// Redacted once here: the error reaches the log, resource.error
+		// (served by GET /resource) and the worker log.
+		handlerErr = redactError(s.handleStore(ctx, db, res.ID))
+		if handlerErr != nil && interrupted() {
+			log.WithError(handlerErr).WithField("id", res.ID).Info("store interrupted by shutdown")
+		} else if handlerErr != nil {
 			log.WithError(handlerErr).WithField("id", res.ID).Error("store failed")
-			s.handleError(res.ID, handlerErr, StatusStoreError, workerID)
+			s.handleError(db, res.ID, handlerErr, StatusStoreError, workerID)
 		} else {
 			log.WithField("id", res.ID).Info("stored successfully")
 			if s.nats != nil {
@@ -355,10 +400,12 @@ func (s *Worker) processClaimed(parentCtx context.Context, db *pg.DB, res *Resou
 		}
 	case StatusDeleting:
 		log.WithField("id", res.ID).Info("deleting started")
-		handlerErr = s.handleDelete(ctx, db, res.ID)
-		if handlerErr != nil {
+		handlerErr = redactError(s.handleDelete(ctx, db, res.ID))
+		if handlerErr != nil && interrupted() {
+			log.WithError(handlerErr).WithField("id", res.ID).Info("delete interrupted by shutdown")
+		} else if handlerErr != nil {
 			log.WithError(handlerErr).WithField("id", res.ID).Error("delete failed")
-			s.handleError(res.ID, handlerErr, StatusDeleteError, workerID)
+			s.handleError(db, res.ID, handlerErr, StatusDeleteError, workerID)
 		} else {
 			log.WithField("id", res.ID).Info("deleted successfully")
 			// handleDelete removes the resource row entirely on success,
@@ -452,7 +499,8 @@ func (s *Worker) releaseLease(db *pg.DB, resourceID, workerID string) {
 // then makes a best-effort attempt to release any leases this pod still
 // holds. Releasing leases on shutdown means a rolling deploy hands work
 // back to the remaining pods immediately instead of making them wait for
-// the 2-minute lease to expire before reclaiming.
+// the 2-minute lease to expire before reclaiming. claimed_by stays as the
+// last holder: a fresh loop recognizes the first attempts it was running.
 func (s *Worker) Close() {
 	log.Info("closing Worker")
 	s.cancel()
@@ -463,19 +511,29 @@ func (s *Worker) Close() {
 	if db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		result, err := db.Model((*Resource)(nil)).
-			Context(ctx).
-			Set("claim_expires_at = NULL").
-			Set("claimed_by = NULL").
-			Where("claimed_by LIKE ?", s.workerBase+"#%").
-			Update()
+		n, err := releasePodLeases(ctx, db, s.workerBase)
 		if err != nil {
 			log.WithError(err).Warn("shutdown lease release failed (leases will expire naturally)")
-		} else if n := result.RowsAffected(); n > 0 {
+		} else if n > 0 {
 			log.WithField("count", n).Info("released leases held by this pod on shutdown")
 		}
 	}
 	log.Info("Worker closed")
+}
+
+// releasePodLeases clears the leases the pod's claim loops still hold,
+// keeping claimed_by (see Close).
+func releasePodLeases(ctx context.Context, db *pg.DB, workerBase string) (int, error) {
+	result, err := db.Model((*Resource)(nil)).
+		Context(ctx).
+		Set("claim_expires_at = NULL").
+		Where("claimed_by LIKE ?", workerBase+"#%").
+		Where("claim_expires_at IS NOT NULL").
+		Update()
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err error) {
@@ -917,8 +975,7 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 // can pick the row up cleanly without relying on the deadline having
 // passed. The WHERE on claimed_by + processing status makes the update
 // safe against concurrent lease transfer.
-func (s *Worker) handleError(id string, err error, errorStatus Status, workerID string) {
-	db := s.pg.Get()
+func (s *Worker) handleError(db *pg.DB, id string, err error, errorStatus Status, workerID string) {
 	errMsg := err.Error()
 	// Determine which processing status we expect the resource to still be in.
 	// Only overwrite if the resource is still in that processing state —
@@ -1081,7 +1138,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err := flush(0); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
 	}
-	log.WithField("url", u).Debug("export url")
+	log.WithField("url", redactURL(u)).Debug("export url")
 	hash, err = s.generateFileHash(ctx, item, ei)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate file hash")
@@ -1332,7 +1389,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 						"part_number": pj.partNumber,
 						"attempt":     i + 1,
 					}).WithError(err).Warn("failed to upload part, retrying")
-					time.Sleep(time.Second * time.Duration(i+1))
+					// Not past a shutdown: Close waits for this job and has
+					// to release its leases inside the pod's grace period.
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Second * time.Duration(i+1)):
+					}
 				}
 				if err != nil {
 					setUploadErr(errors.Wrapf(err, "failed to upload part, bucket=%s, key=%s, upload_id=%s, part_number=%d", s.bucket, hash, f.UploadID, pj.partNumber))
@@ -1363,7 +1425,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		r, err := s.api.DownloadWithRange(dctx, u, int(stored), -1)
 		if err != nil {
 			dcancel()
-			return nil, nil, errors.Wrapf(err, "failed to download file content with range, url=%s, start=%d", u, stored)
+			return nil, nil, errors.Wrapf(err, "failed to download file content with range, url=%s, start=%d", redactURL(u), stored)
 		}
 		return r, dcancel, nil
 	}
@@ -1429,7 +1491,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				if dcancel != nil {
 					dcancel()
 				}
-				time.Sleep(time.Duration(attempt) * 5 * time.Second)
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Duration(attempt) * 5 * time.Second):
+				}
+				if ctx.Err() != nil {
+					// Shutdown: 30 s of sleeps here outlasted the pod's grace
+					// period, and Close never got to release the leases.
+					readErr = ctx.Err()
+					break
+				}
 				r, dcancel, err = openDownload()
 				if err != nil {
 					readErr = err
@@ -1534,7 +1605,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 	if size < limitStart+limitEnd {
 		r, err := s.api.Download(dctx, u)
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to download file for hash generation, url=%s", u)
+			return "", errors.Wrapf(err, "failed to download file for hash generation, url=%s", redactURL(u))
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()
@@ -1546,7 +1617,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 	} else {
 		r, err := s.api.DownloadWithRange(dctx, u, 0, int(limitStart))
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to download file start for hash generation, url=%s, range=0-%d", u, limitStart)
+			return "", errors.Wrapf(err, "failed to download file start for hash generation, url=%s, range=0-%d", redactURL(u), limitStart)
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()
@@ -1557,7 +1628,7 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 		}
 		r, err = s.api.DownloadWithRange(dctx, u, int(size-limitEnd), -1)
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to download file end for hash generation, url=%s, range=%d-end", u, size-limitEnd)
+			return "", errors.Wrapf(err, "failed to download file end for hash generation, url=%s, range=%d-end", redactURL(u), size-limitEnd)
 		}
 		defer func(r io.ReadCloser) {
 			_ = r.Close()

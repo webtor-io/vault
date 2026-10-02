@@ -19,7 +19,7 @@ make build
 swag init -g services/web.go --instanceName vault
 ```
 
-There are no tests in this repository currently.
+Tests: `go test ./...`. The claim and shutdown tests need a throwaway Postgres in `VAULT_TEST_PG_DSN` and skip without it (see `services/worker_claim_test.go`).
 
 ## Architecture
 
@@ -43,6 +43,7 @@ The `serve` command initializes all components in order: PG connection → migra
 - All store/delete operations are **asynchronous** — API returns 202, worker processes later
 - **Deduplication** via content-hash-based `File` records shared across `Resource`s
 - Worker uses **`FOR UPDATE SKIP LOCKED`** for safe concurrent job claiming
+- A job cut short by shutdown is **not** a failure: it stays `storing`, `Close` clears the lease (keeping `claimed_by` as the last holder) and another pod resumes it at once
 - Resource status lifecycle: `queued_for_storing` → `storing` → `stored` (or `store_error`), `queued_for_deletion` → `deleting` → (deleted or `delete_error`)
 - Error wrapping with `pkg/errors` throughout worker code
 
@@ -59,7 +60,7 @@ All config via CLI flags or environment variables (urfave/cli). Key groups:
 - **Web:** `WEB_HOST`, `WEB_PORT` (default 8080), `S3_CACHE_URL` (when set, `/webseed` GET redirects through s3-cache instead of presigned S3; empty = legacy presigned path, rollback is a single env unset)
 - **PostgreSQL:** `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB`
 - **S3:** `S3_ENDPOINT`/`AWS_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY`/`AWS_ACCESS_KEY_ID`, `S3_SECRET_KEY`/`AWS_SECRET_ACCESS_KEY`
-- **Worker:** `WORKERS` (default 10), `AWS_UPLOAD_CONCURRENCY` (default 1), `AWS_UPLOAD_PART_SIZE` (default 50MB), `RESOURCE_ID` (debug single resource)
+- **Worker:** `WORKERS` (default 10), `FRESH_WORKERS` (default 0: extra claim loops, lease owner `<host>#f<i>`, that take only new work — queued rows and first attempts a fresh loop was running when its pod stopped — so a new pledge does not wait behind retries), `AWS_UPLOAD_CONCURRENCY` (default 1), `AWS_UPLOAD_PART_SIZE` (default 50MB), `RESOURCE_ID` (debug single resource)
 - **REST API:** `REST_API_SERVICE_HOST`, `REST_API_SERVICE_PORT`, `REST_API_SECURE`, `WEBTOR_API_KEY`, `WEBTOR_API_SECRET`
 - **NATS/Probe/Pprof:** registered via `common-services`
 
