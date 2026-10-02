@@ -39,6 +39,7 @@ const (
 )
 
 func RegisterWebFlags(f []cli.Flag) []cli.Flag {
+	f = cs.RegisterShutdownFlags(f)
 	return append(f,
 		cli.StringFlag{
 			Name:   webHostFlag,
@@ -66,7 +67,7 @@ func RegisterWebFlags(f []cli.Flag) []cli.Flag {
 type Web struct {
 	host string
 	port int
-	ln   net.Listener
+	gs   *cs.GracefulServer
 	pg   *cs.PG
 	s3   *cs.S3Client
 	// bucket to read objects from (same as worker's AWS_BUCKET)
@@ -79,6 +80,7 @@ func NewWeb(c *cli.Context, pg *cs.PG, s3 *cs.S3Client) *Web {
 	return &Web{
 		host:       c.String(webHostFlag),
 		port:       c.Int(webPortFlag),
+		gs:         cs.NewGracefulServer(cs.ShutdownTimeout(c)),
 		pg:         pg,
 		s3:         s3,
 		bucket:     c.String("aws-bucket"),
@@ -89,7 +91,6 @@ func NewWeb(c *cli.Context, pg *cs.PG, s3 *cs.S3Client) *Web {
 func (s *Web) Serve() error {
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
 	ln, err := net.Listen("tcp", addr)
-	s.ln = ln
 	if err != nil {
 		return errors.Wrap(err, "Failed to web listen to tcp connection")
 	}
@@ -111,7 +112,7 @@ func (s *Web) Serve() error {
 	docs.SwaggerInfovault.BasePath = "/"
 
 	log.Infof("serving Web at %v", addr)
-	return http.Serve(s.ln, r)
+	return s.gs.Serve(&http.Server{Handler: r}, ln)
 }
 
 func (s *Web) errorHandler(c *gin.Context) {
@@ -138,12 +139,10 @@ func (s *Web) errorHandler(c *gin.Context) {
 	c.PureJSON(status, &ErrorResponse{Error: ginErr.Error()})
 }
 
+// Close drains in-flight requests (WEB_SHUTDOWN_TIMEOUT) before returning.
+// Closing only the listener let a terminating pod exit mid-response -- a
+// pledge's synchronous PUT from web-ui among them. It must run before PG is
+// closed: serve() defers it after PG.
 func (s *Web) Close() {
-	log.Info("closing Web")
-	defer func() {
-		log.Info("Web closed")
-	}()
-	if s.ln != nil {
-		_ = s.ln.Close()
-	}
+	s.gs.Close()
 }
