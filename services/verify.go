@@ -116,8 +116,10 @@ func verifyFileAgainstMetainfo(ctx context.Context, s3Cl *awss3.S3, bucket, key 
 	for pieceGlobal := firstFullGlobal; pieceGlobal < lastFullGlobal; pieceGlobal += pieceLen {
 		idx := int(pieceGlobal / pieceLen)
 		piece := mi.Piece(idx)
-		if piece.Length() != pieceLen {
-			return errors.Errorf("verify: piece %d expected length %d, got %d", idx, pieceLen, piece.Length())
+		// V1Length: the hash below is the v1 hash, and the fork's Length()
+		// walks the v2 file tree, which panics on a malformed one.
+		if piece.V1Length() != pieceLen {
+			return errors.Errorf("verify: piece %d expected length %d, got %d", idx, pieceLen, piece.V1Length())
 		}
 		if _, err := io.ReadFull(out.Body, buf); err != nil {
 			return errors.Wrapf(err, "verify: read piece %d from stream", idx)

@@ -3,7 +3,7 @@ module github.com/webtor-io/vault
 go 1.26
 
 require (
-	github.com/anacrolix/torrent v1.59.1
+	github.com/anacrolix/torrent v1.60.1-0.20250925080637-414bd5781457
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/gin-gonic/gin v1.11.0
 	github.com/go-pg/pg/v10 v10.15.0
@@ -140,3 +140,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/anacrolix/torrent => github.com/webtor-io/torrent v0.0.0-20260925081045-553f70d9836b
