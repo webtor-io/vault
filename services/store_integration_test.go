@@ -627,3 +627,29 @@ func TestVerifyExisting_UnreliableSourceBlamesNothing(t *testing.T) {
 		t.Fatalf("stats %+v rows %d: want unresolved, nothing invalidated", stats, len(e.fileRows()))
 	}
 }
+
+// Independent transient bad reads on different pieces each get their re-reads;
+// the limit is per piece. Before, the third one in a big file ended the attempt.
+func TestStore_RewindLimitIsPerPiece(t *testing.T) {
+	files := []testFile{{"a", pattern(9, 22*mib+7)}}
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	bad := []int64{3*mib + 10, 8*mib + 10, 13*mib + 10}
+	n := 0
+	e.src.mutate = func(name string, start, end int64, data []byte) {
+		if end >= 0 || start >= int64(len(files[0].bytes))-500*1024 || n >= len(bad) {
+			return // only the main stream, once per bad offset
+		}
+		if b := bad[n]; start <= b && b-start < int64(len(data)) {
+			data[b-start] ^= 0xFF
+			n++
+		}
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+	if n != len(bad) {
+		t.Fatalf("injected %d bad reads, want %d", n, len(bad))
+	}
+}

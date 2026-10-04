@@ -1391,8 +1391,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 
 	const maxDownloadRetries = 3
 	// A piece mismatch re-reads from the part holding the piece's first byte,
-	// keeping the parts before it, at most this many times per call.
+	// keeping the parts before it: up to maxRewinds times for the same piece,
+	// maxRewindsTotal for the whole call (a bad source hits pieces at random).
 	const maxRewinds = 2
+	const maxRewindsTotal = 20
 
 	type partJob struct {
 		partNumber int64
@@ -1603,6 +1605,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			UploadId: aws.String(f.UploadID),
 		})
 	}
+	lastBad, badRepeats := -1, 0
 	for rewinds := 0; ; rewinds++ {
 		err := streamParts()
 		if err == nil {
@@ -1642,16 +1645,20 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				return nil, errors.Wrapf(err, "stored file %s holds bytes the torrent does not; queued for re-store", corrupt[0].hash)
 			}
 		}
-		if rewinds >= maxRewinds {
+		if m.Piece != lastBad {
+			lastBad, badRepeats = m.Piece, 0
+		}
+		if badRepeats >= maxRewinds || rewinds >= maxRewindsTotal {
 			return nil, err
 		}
+		badRepeats++
 		rewound := partStart(max(0, m.Start-fileOff), partSize, f.TotalSize)
 		log.WithError(err).WithFields(log.Fields{
 			"resource_id": id,
 			"key":         hash,
 			"piece":       m.Piece,
 			"rewind_to":   rewound,
-			"attempt":     rewinds + 1,
+			"attempt":     badRepeats,
 		}).Warn("piece mismatch, re-reading from the part holding it")
 		stored, partNumber = rewound, rewound/partSize+1
 		mu.Lock()
