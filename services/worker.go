@@ -647,13 +647,18 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// order so that the next file's pieceVerifier can pull left-boundary
 	// prefix bytes from S3.
 	var prevFiles []prevFileInfo
+	// The verifier completes boundary pieces with bytes read from the torrent.
+	var src sourceFetcher
+	if mi != nil {
+		src = s.newSourceFetcher(cla, id, mi, fileItems)
+	}
 	// Phase 2: store files sequentially using the fixed listing.
 	for _, item := range fileItems {
 		var fileOff int64 = -1
 		if mi != nil {
 			fileOff = fileOffsetInTorrent(mi, item.PathStr, item.Size)
 		}
-		f, err := s.storeFile(ctx, cla, id, item, totalStored, mi, prevFiles)
+		f, err := s.storeFile(ctx, cla, id, item, totalStored, mi, prevFiles, src)
 		if err != nil {
 			return errors.Wrap(err, "failed to store file")
 		}
@@ -1042,7 +1047,7 @@ func runPeriodicFlush(ctx context.Context, fn func()) context.CancelFunc {
 	return cancel
 }
 
-func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64, mi *metainfo.Info, prevFiles []prevFileInfo) (*File, error) {
+func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.ListItem, totalStored int64, mi *metainfo.Info, prevFiles []prevFileInfo, src sourceFetcher) (*File, error) {
 
 	if s.bucket == "" {
 		return nil, errors.New("s3 bucket is not configured")
@@ -1050,18 +1055,46 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	db := s.pg.Get()
 	// Try to find an already stored file by matching resource_file.path and file.total_size
 	// This allows deduplication by common path and size across resources
+	// A file this resource already stored is reused as is; another
+	// resource's file with the same path and size can hold other content, so
+	// it is reused only when one of this torrent's pieces matches it.
 	var existing File
+	sameResource := true
 	err := db.Model(&existing).
 		Context(ctx).
 		Column("file.*").
 		Join("JOIN resource_file AS rf ON rf.file_hash = file.hash").
 		Where("rf.path = ?", item.PathStr).
+		Where("rf.resource_id = ?", id).
 		Where("file.total_size = ?", item.Size).
 		Where("file.status = ?", StatusStored).
 		Limit(1).
 		Select()
+	if errors.Is(err, pg.ErrNoRows) {
+		sameResource = false
+		err = db.Model(&existing).
+			Context(ctx).
+			Column("file.*").
+			Join("JOIN resource_file AS rf ON rf.file_hash = file.hash").
+			Where("rf.path = ?", item.PathStr).
+			Where("file.total_size = ?", item.Size).
+			Where("file.status = ?", StatusStored).
+			Limit(1).
+			Select()
+	}
 	if err != nil && !errors.Is(err, pg.ErrNoRows) {
 		return nil, errors.Wrap(err, "failed to check for existing file")
+	}
+	if err == nil && !sameResource && mi != nil {
+		ok, mErr := matchesTorrentPiece(ctx, s.s3.Get(), s.bucket, existing.Hash, mi, fileOffsetInTorrent(mi, item.PathStr, item.Size), item.Size)
+		if mErr != nil {
+			return nil, errors.Wrap(mErr, "failed to check dedup candidate against torrent")
+		}
+		if !ok {
+			log.WithFields(log.Fields{"hash": existing.Hash, "path": item.PathStr, "resource_id": id}).
+				Info("path+size dedup candidate does not match this torrent, storing separately")
+			err = pg.ErrNoRows
+		}
 	}
 	if err == nil {
 		// Verify the S3 object actually exists before trusting DB status.
@@ -1124,6 +1157,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	mu.Lock()
 	var completedParts []*awss3.CompletedPart
 	completedPartsMap := make(map[int64]*awss3.CompletedPart)
+	partSizes := make(map[int64]int64)
 	mu.Unlock()
 	partSize := s.part
 	if partSize < 5*1024*1024 {
@@ -1277,6 +1311,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 				ETag:       p.ETag,
 				PartNumber: p.PartNumber,
 			}
+			partSizes[*p.PartNumber] = aws.Int64Value(p.Size)
 			if *p.PartNumber >= partNumber {
 				partNumber = *p.PartNumber + 1
 			}
@@ -1307,12 +1342,30 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		}
 	}
 
-	mu.Lock()
-	stored := int64(len(completedPartsMap)) * partSize
-	mu.Unlock()
-	if stored > f.TotalSize {
-		stored = f.TotalSize
+	var fileOff int64 = -1
+	if mi != nil {
+		fileOff = fileOffsetInTorrent(mi, item.PathStr, item.Size)
+		if fileOff < 0 {
+			return nil, errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
+		}
 	}
+	// Resume after the parts stored without a gap; with verification, from
+	// the part holding the start of the piece they cut, so that piece is
+	// streamed and verified whole (see resumeOffset).
+	mu.Lock()
+	stored := min(contiguousParts(partSizes, partSize, f.TotalSize)*partSize, f.TotalSize)
+	if stored < f.TotalSize {
+		if mi != nil {
+			stored = resumeOffset(stored, fileOff, mi.PieceLength, partSize, f.TotalSize)
+		}
+		partNumber = stored/partSize + 1
+		for n := range completedPartsMap {
+			if n >= partNumber {
+				delete(completedPartsMap, n) // re-uploaded below, replacing it
+			}
+		}
+	}
+	mu.Unlock()
 
 	if err := flush(stored); err != nil {
 		log.WithError(err).Error("initial flush progress failed")
@@ -1322,16 +1375,11 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// verifier hashes piece-aligned chunks as they flow through this loop —
 	// catching a mismatch here lets us abort the multipart upload before
 	// committing bad bytes, instead of having to re-download from S3 after
-	// completion. Resume case: if `stored > 0`, Bootstrap pulls the already-
-	// uploaded prefix from this file's S3 object so the in-progress piece
-	// state matches the actual stored bytes.
+	// completion. Resume case: `stored` is the start of a part (resumeOffset)
+	// and Bootstrap seeds the piece it cuts from the source.
 	var verifier *pieceVerifier
 	if mi != nil {
-		fileOff := fileOffsetInTorrent(mi, item.PathStr, item.Size)
-		if fileOff < 0 {
-			return nil, errors.Errorf("verify: file %q (size %d) not found in torrent metainfo", item.PathStr, item.Size)
-		}
-		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket))
+		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket)).withSource(src)
 		if err := verifier.Bootstrap(ctx, stored); err != nil {
 			// Bootstrap pulls already-uploaded bytes through the hasher;
 			// failure means the resume prefix is corrupt (or prev files
@@ -1354,67 +1402,13 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 
 	const maxDownloadRetries = 3
+	// A piece mismatch re-reads from the part holding the piece's first byte,
+	// keeping the parts before it, at most this many times per call.
+	const maxRewinds = 2
 
 	type partJob struct {
 		partNumber int64
 		data       []byte
-	}
-
-	jobs := make(chan partJob, s.concur)
-	var uploadErr error
-	var uploadErrOnce sync.Once
-	setUploadErr := func(err error) {
-		uploadErrOnce.Do(func() {
-			uploadErr = err
-		})
-	}
-	var wg sync.WaitGroup
-
-	for i := 0; i < s.concur; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for pj := range jobs {
-				var upOut *awss3.UploadPartOutput
-				var err error
-				for i := 0; i < 3; i++ {
-					upOut, err = s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
-						Bucket:     aws.String(s.bucket),
-						Key:        aws.String(hash),
-						UploadId:   aws.String(f.UploadID),
-						PartNumber: aws.Int64(pj.partNumber),
-						Body:       bytes.NewReader(pj.data),
-					}, unsignedOverTLS)
-					if err == nil {
-						break
-					}
-					log.WithFields(log.Fields{
-						"bucket":      s.bucket,
-						"resource_id": id,
-						"key":         hash,
-						"upload_id":   f.UploadID,
-						"part_number": pj.partNumber,
-						"attempt":     i + 1,
-					}).WithError(err).Warn("failed to upload part, retrying")
-					// Not past a shutdown: Close waits for this job and has
-					// to release its leases inside the pod's grace period.
-					select {
-					case <-ctx.Done():
-					case <-time.After(time.Second * time.Duration(i+1)):
-					}
-				}
-				if err != nil {
-					setUploadErr(errors.Wrapf(err, "failed to upload part, bucket=%s, key=%s, upload_id=%s, part_number=%d", s.bucket, hash, f.UploadID, pj.partNumber))
-					continue
-				}
-				mu.Lock()
-				completedPartsMap[pj.partNumber] = &awss3.CompletedPart{
-					ETag:       upOut.ETag,
-					PartNumber: aws.Int64(pj.partNumber),
-				}
-				mu.Unlock()
-			}
-		}()
 	}
 
 	// openDownload creates a new download stream from the current stored offset
@@ -1437,122 +1431,250 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		return r, dcancel, nil
 	}
 
-	r, dcancel, err := openDownload()
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if dcancel != nil {
-			dcancel()
+	// streamParts reads parts from `stored` to the end of the file through the
+	// verifier and uploads them on s.concur workers. It returns only after every
+	// started part upload has finished, so a rewind can re-upload part numbers
+	// without racing an older upload of the same part.
+	streamParts := func() error {
+		jobs := make(chan partJob, s.concur)
+		var uploadErr error
+		var uploadErrOnce sync.Once
+		setUploadErr := func(err error) {
+			uploadErrOnce.Do(func() {
+				mu.Lock()
+				uploadErr = err
+				mu.Unlock()
+			})
 		}
-	}()
-	defer func() {
-		if r != nil {
-			_ = r.Close()
-		}
-	}()
-
-	for stored < f.TotalSize {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		if uploadErr != nil {
-			break
-		}
-
-		currentPartSize := partSize
-		if stored+2*currentPartSize > f.TotalSize {
-			currentPartSize = f.TotalSize - stored
-		}
-
-		log.WithFields(log.Fields{
-			"bucket":      s.bucket,
-			"resource_id": id,
-			"path":        item.PathStr,
-			"key":         hash,
-			"size":        item.Size,
-			"upload_id":   f.UploadID,
-			"part_number": partNumber,
-			"part_size":   currentPartSize,
-			"start_byte":  stored,
-		}).Info("reading part")
-
-		buf := make([]byte, currentPartSize)
-		_, readErr := io.ReadFull(r, buf)
-		if readErr != nil {
-			// Connection dropped or timeout — retry download from current offset.
-			retried := false
-			for attempt := 1; attempt <= maxDownloadRetries; attempt++ {
-				log.WithFields(log.Fields{
-					"resource_id": id,
-					"stored":      stored,
-					"attempt":     attempt,
-				}).WithError(readErr).Warn("download stream interrupted, reconnecting")
-				// r/dcancel may be nil if a previous openDownload() in this
-				// retry loop failed — only clean up a live reader.
-				if r != nil {
-					_ = r.Close()
+		var wg sync.WaitGroup
+		for i := 0; i < s.concur; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for pj := range jobs {
+					var upOut *awss3.UploadPartOutput
+					var err error
+					for i := 0; i < 3; i++ {
+						upOut, err = s3Cl.UploadPartWithContext(ctx, &awss3.UploadPartInput{
+							Bucket:     aws.String(s.bucket),
+							Key:        aws.String(hash),
+							UploadId:   aws.String(f.UploadID),
+							PartNumber: aws.Int64(pj.partNumber),
+							Body:       bytes.NewReader(pj.data),
+						}, unsignedOverTLS)
+						if err == nil {
+							break
+						}
+						log.WithFields(log.Fields{
+							"bucket":      s.bucket,
+							"resource_id": id,
+							"key":         hash,
+							"upload_id":   f.UploadID,
+							"part_number": pj.partNumber,
+							"attempt":     i + 1,
+						}).WithError(err).Warn("failed to upload part, retrying")
+						// Not past a shutdown: Close waits for this job and has
+						// to release its leases inside the pod's grace period.
+						select {
+						case <-ctx.Done():
+						case <-time.After(time.Second * time.Duration(i+1)):
+						}
+					}
+					if err != nil {
+						setUploadErr(errors.Wrapf(err, "failed to upload part, bucket=%s, key=%s, upload_id=%s, part_number=%d", s.bucket, hash, f.UploadID, pj.partNumber))
+						continue
+					}
+					mu.Lock()
+					completedPartsMap[pj.partNumber] = &awss3.CompletedPart{
+						ETag:       upOut.ETag,
+						PartNumber: aws.Int64(pj.partNumber),
+					}
+					mu.Unlock()
 				}
+			}()
+		}
+
+		streamErr := func() error {
+			r, dcancel, err := openDownload()
+			if err != nil {
+				return err
+			}
+			defer func() {
 				if dcancel != nil {
 					dcancel()
 				}
+			}()
+			defer func() {
+				if r != nil {
+					_ = r.Close()
+				}
+			}()
+			for stored < f.TotalSize {
 				select {
 				case <-ctx.Done():
-				case <-time.After(time.Duration(attempt) * 5 * time.Second):
+					return ctx.Err()
+				default:
 				}
-				if ctx.Err() != nil {
-					// Shutdown: 30 s of sleeps here outlasted the pod's grace
-					// period, and Close never got to release the leases.
-					readErr = ctx.Err()
-					break
+				mu.Lock()
+				failed := uploadErr != nil
+				mu.Unlock()
+				if failed {
+					return nil // reported below, after the workers stop
 				}
-				r, dcancel, err = openDownload()
-				if err != nil {
-					readErr = err
-					continue
-				}
-				_, readErr = io.ReadFull(r, buf)
-				if readErr == nil {
-					retried = true
-					break
-				}
-			}
-			if !retried {
-				setUploadErr(errors.Wrap(readErr, "failed to read part data from download stream"))
-				break
-			}
-		}
 
-		// Inline integrity check before the part is uploaded — catches a
-		// piece SHA-1 mismatch in time to abort the multipart upload
-		// without committing bad bytes.
-		if verifier != nil {
-			if vErr := verifier.Feed(ctx, buf); vErr != nil {
-				setUploadErr(errors.Wrap(vErr, "integrity verification failed during upload"))
-				break
+				currentPartSize := partSize
+				if stored+2*currentPartSize > f.TotalSize {
+					currentPartSize = f.TotalSize - stored
+				}
+
+				log.WithFields(log.Fields{
+					"bucket":      s.bucket,
+					"resource_id": id,
+					"path":        item.PathStr,
+					"key":         hash,
+					"size":        item.Size,
+					"upload_id":   f.UploadID,
+					"part_number": partNumber,
+					"part_size":   currentPartSize,
+					"start_byte":  stored,
+				}).Info("reading part")
+
+				buf := make([]byte, currentPartSize)
+				_, readErr := io.ReadFull(r, buf)
+				if readErr != nil {
+					// Connection dropped or timeout — retry download from current offset.
+					retried := false
+					for attempt := 1; attempt <= maxDownloadRetries; attempt++ {
+						log.WithFields(log.Fields{
+							"resource_id": id,
+							"stored":      stored,
+							"attempt":     attempt,
+						}).WithError(readErr).Warn("download stream interrupted, reconnecting")
+						// r/dcancel may be nil if a previous openDownload() in this
+						// retry loop failed — only clean up a live reader.
+						if r != nil {
+							_ = r.Close()
+						}
+						if dcancel != nil {
+							dcancel()
+						}
+						select {
+						case <-ctx.Done():
+						case <-time.After(time.Duration(attempt) * 5 * time.Second):
+						}
+						if ctx.Err() != nil {
+							// Shutdown: 30 s of sleeps here outlasted the pod's grace
+							// period, and Close never got to release the leases.
+							return ctx.Err()
+						}
+						r, dcancel, err = openDownload()
+						if err != nil {
+							readErr = err
+							continue
+						}
+						_, readErr = io.ReadFull(r, buf)
+						if readErr == nil {
+							retried = true
+							break
+						}
+					}
+					if !retried {
+						return errors.Wrap(readErr, "failed to read part data from download stream")
+					}
+				}
+
+				// Inline integrity check before the part is uploaded.
+				if verifier != nil {
+					if vErr := verifier.Feed(ctx, buf); vErr != nil {
+						return vErr
+					}
+				}
+
+				jobs <- partJob{
+					partNumber: partNumber,
+					data:       buf,
+				}
+
+				stored += currentPartSize
+				partNumber++
 			}
+			return nil
+		}()
+		close(jobs)
+		wg.Wait()
+		if streamErr != nil {
+			return streamErr
 		}
-
-		jobs <- partJob{
-			partNumber: partNumber,
-			data:       buf,
-		}
-
-		stored += currentPartSize
-		partNumber++
+		return uploadErr
 	}
-	close(jobs)
-	wg.Wait()
 
-	if uploadErr != nil {
+	abort := func() {
 		_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
 			Bucket:   aws.String(s.bucket),
 			Key:      aws.String(hash),
 			UploadId: aws.String(f.UploadID),
 		})
-		return nil, uploadErr
+	}
+	for rewinds := 0; ; rewinds++ {
+		err := streamParts()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			// Cut short (shutdown, lost lease): the parts stay for resume.
+			return nil, ctx.Err()
+		}
+		var m *pieceMismatchError
+		if !errors.As(err, &m) {
+			abort()
+			return nil, err
+		}
+		err = errors.Wrap(err, "integrity verification failed during upload")
+		if m.Start < fileOff {
+			// Left boundary: the previous files' bytes came from S3. If the
+			// piece verifies with them read from the torrent, the stored copies
+			// that differ are corrupt; they go back to storing.
+			corrupt, hErr := s.corruptPrevFiles(ctx, s3Cl, prevFiles, src, m)
+			if hErr != nil {
+				log.WithError(hErr).WithField("resource_id", id).Warn("could not check previous files after a left-boundary mismatch")
+			}
+			if len(corrupt) > 0 {
+				abort()
+				for _, pf := range corrupt {
+					if iErr := invalidateStoredFile(ctx, db, pf.hash); iErr != nil {
+						return nil, errors.Wrapf(iErr, "failed to queue corrupt file %s for re-store", pf.hash)
+					}
+					log.WithFields(log.Fields{"resource_id": id, "hash": pf.hash, "piece": m.Piece}).
+						Warn("stored file failed boundary verification; queued for re-store")
+				}
+				return nil, errors.Wrapf(err, "stored file %s holds bytes the torrent does not; queued for re-store", corrupt[0].hash)
+			}
+		}
+		if rewinds >= maxRewinds {
+			abort()
+			return nil, err
+		}
+		rewound := partStart(max(0, m.Start-fileOff), partSize, f.TotalSize)
+		log.WithError(err).WithFields(log.Fields{
+			"resource_id": id,
+			"key":         hash,
+			"piece":       m.Piece,
+			"rewind_to":   rewound,
+			"attempt":     rewinds + 1,
+		}).Warn("piece mismatch, re-reading from the part holding it")
+		stored, partNumber = rewound, rewound/partSize+1
+		mu.Lock()
+		for n := range completedPartsMap {
+			if n >= partNumber {
+				delete(completedPartsMap, n)
+			}
+		}
+		mu.Unlock()
+		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket)).withSource(src)
+		if bErr := verifier.Bootstrap(ctx, stored); bErr != nil {
+			abort()
+			return nil, errors.Wrap(bErr, "verifier bootstrap after rewind")
+		}
 	}
 
 	mu.Lock()

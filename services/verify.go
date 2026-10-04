@@ -11,6 +11,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/aws/aws-sdk-go/aws"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
+	pg "github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -145,4 +146,80 @@ func verifyFileAgainstMetainfo(ctx context.Context, s3Cl *awss3.S3, bucket, key 
 		"total_pieces":     mi.NumPieces(),
 	}).Info("integrity verification passed")
 	return nil
+}
+
+// matchesTorrentPiece reports whether the stored object holds this torrent's
+// bytes, by hashing the first piece that lies wholly inside the file. A file
+// with no such piece cannot be matched this way and reports false.
+func matchesTorrentPiece(ctx context.Context, s3Cl *awss3.S3, bucket, key string, mi *metainfo.Info, fileOff, fileLen int64) (bool, error) {
+	pl := mi.PieceLength
+	if fileOff < 0 || pl <= 0 {
+		return false, nil
+	}
+	first := (fileOff + pl - 1) / pl * pl
+	if first+pl > fileOff+fileLen {
+		return false, nil
+	}
+	want := mi.Piece(int(first / pl)).V1Hash()
+	if !want.Ok {
+		return false, nil
+	}
+	data, err := newS3ByteFetcher(s3Cl, bucket)(ctx, key, first-fileOff, first-fileOff+pl)
+	if err != nil {
+		return false, err
+	}
+	got := sha1.Sum(data)
+	return bytes.Equal(got[:], want.Value[:]), nil
+}
+
+// corruptPrevFiles explains a left-boundary mismatch. The piece's bytes before
+// this file came from the previous files' S3 objects; if the whole piece read
+// from the torrent instead hashes right, every previous file whose stored bytes
+// differ from the torrent's is corrupt — stored before right-boundary
+// verification existed. If the torrent's bytes do not hash right either, the
+// source is not trustworthy right now and nothing is blamed.
+func (s *Worker) corruptPrevFiles(ctx context.Context, s3Cl *awss3.S3, prev []prevFileInfo, src sourceFetcher, m *pieceMismatchError) ([]prevFileInfo, error) {
+	if src == nil {
+		return nil, nil
+	}
+	fresh, err := src(ctx, m.Start, m.End)
+	if errors.Is(err, errSourceUnavailable) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sum := sha1.Sum(fresh); !bytes.Equal(sum[:], m.Want) {
+		return nil, nil
+	}
+	fetch := newS3ByteFetcher(s3Cl, s.bucket)
+	var bad []prevFileInfo
+	for _, pf := range prev {
+		from, to := max(m.Start, pf.torrentOff), min(m.End, pf.torrentOff+pf.length)
+		if from >= to {
+			continue
+		}
+		stored, err := fetch(ctx, pf.hash, from-pf.torrentOff, to-pf.torrentOff)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(stored, fresh[from-m.Start:to-m.Start]) {
+			bad = append(bad, pf)
+		}
+	}
+	return bad, nil
+}
+
+// invalidateStoredFile sends a stored file back to storing, so the next store
+// of a resource holding it uploads it again instead of reusing the object.
+func invalidateStoredFile(ctx context.Context, db *pg.DB, hash string) error {
+	_, err := db.Model((*File)(nil)).Context(ctx).
+		Set("status = ?", StatusStoring).
+		Set("stored_size = 0").
+		Set("upload_id = ''").
+		Set("updated_at = now()").
+		Where("hash = ?", hash).
+		Where("status = ?", StatusStored).
+		Update()
+	return err
 }
