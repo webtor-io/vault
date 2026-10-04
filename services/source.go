@@ -55,7 +55,7 @@ func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 // newSourceFetcher reads torrent-global byte ranges from the content source:
 // each listed file through its export URL (thp), BEP 47 padding as zeros. A
 // range touching a file the listing does not have is errSourceUnavailable.
-func (s *Worker) newSourceFetcher(cla *Claims, id string, mi *metainfo.Info, items []ra.ListItem) sourceFetcher {
+func newSourceFetcher(api *Api, cla *Claims, id string, mi *metainfo.Info, items []ra.ListItem) sourceFetcher {
 	spans := torrentSpans(mi, items)
 	var mu sync.Mutex
 	urls := map[string]string{}
@@ -66,7 +66,7 @@ func (s *Worker) newSourceFetcher(cla *Claims, id string, mi *metainfo.Info, ite
 		if ok {
 			return u, nil
 		}
-		ei, err := s.api.ExportResourceContent(ctx, cla, id, it.ID)
+		ei, err := api.ExportResourceContent(ctx, cla, id, it.ID)
 		if err != nil {
 			return "", errors.Wrap(err, "export for verification source")
 		}
@@ -94,7 +94,7 @@ func (s *Worker) newSourceFetcher(cla *Claims, id string, mi *metainfo.Info, ite
 			if err != nil {
 				return nil, err
 			}
-			data, err := s.readRange(ctx, u, from-sp.off, to-sp.off)
+			data, err := readRange(ctx, api, u, from-sp.off, to-sp.off)
 			if err != nil {
 				return nil, err
 			}
@@ -108,10 +108,10 @@ func (s *Worker) newSourceFetcher(cla *Claims, id string, mi *metainfo.Info, ite
 }
 
 // readRange downloads [start, end) of one file, retrying a short read.
-func (s *Worker) readRange(ctx context.Context, u string, start, end int64) ([]byte, error) {
+func readRange(ctx context.Context, api *Api, u string, start, end int64) ([]byte, error) {
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		r, err := s.api.DownloadWithRange(ctx, u, int(start), int(end-1))
+		r, err := api.DownloadWithRange(ctx, u, int(start), int(end-1))
 		if err == nil {
 			buf := make([]byte, end-start)
 			_, err = io.ReadFull(r, buf)

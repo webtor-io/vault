@@ -139,8 +139,10 @@ type fakeTorrent struct {
 	// mutate may change the bytes served for one GET of a file; streaming
 	// (open-ended) requests have end == -1.
 	mutate func(name string, start, end int64, data []byte)
-	mu     sync.Mutex
-	opens  []string // "name@start" of every open-ended (streaming) request
+	// fail answers one GET of a file with 500 when it returns true.
+	fail  func(name string, start, end int64) bool
+	mu    sync.Mutex
+	opens []string // "name@start" of every open-ended (streaming) request
 }
 
 func (ft *fakeTorrent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +186,11 @@ func (ft *fakeTorrent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		out := append([]byte(nil), data[start:hi+1]...)
 		ft.mu.Lock()
+		if ft.fail != nil && ft.fail(name, start, end) {
+			ft.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if end < 0 {
 			ft.opens = append(ft.opens, fmt.Sprintf("%s@%d", name, start))
 		}
@@ -430,4 +437,193 @@ func TestStore_ResumeReUploadsTheCutPiecesPart(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	e.assertStored(files)
+}
+
+// seedStored stores files as an already-stored resource: rows, links, objects.
+func (e *storeEnv) seedStored(files []testFile, objects map[string][]byte) {
+	e.t.Helper()
+	if _, err := e.db.Exec(`UPDATE resource SET status = 2 WHERE resource_id = 'ih'`); err != nil {
+		e.t.Fatal(err)
+	}
+	for _, f := range files {
+		key := contentKey(f.bytes)
+		obj, ok := objects[f.name]
+		if !ok {
+			obj = f.bytes
+		}
+		e.s3.objects[key] = obj
+		if _, err := e.db.Exec(`INSERT INTO file (hash, status, total_size, stored_size) VALUES (?, 2, ?, ?)`, key, len(f.bytes), len(f.bytes)); err != nil {
+			e.t.Fatal(err)
+		}
+		if _, err := e.db.Exec(`INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('ih', ?, ?)`, key, "/t/"+f.name); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+}
+
+func (e *storeEnv) verifyExisting(boundariesOnly bool) VerifyExistingStats {
+	e.t.Helper()
+	stats, err := RunVerifyExisting(context.Background(), e.w.pg, e.w.s3, e.w.api, "vault",
+		VerifyExistingOptions{ResourceID: "ih", BoundariesOnly: boundariesOnly})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return stats
+}
+
+func (e *storeEnv) fileRows() map[string]bool {
+	var hashes []string
+	if _, err := e.db.Query(&hashes, `SELECT hash FROM file`); err != nil {
+		e.t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, h := range hashes {
+		out[h] = true
+	}
+	return out
+}
+
+// A stored file whose tail is corrupt (its boundary piece was never verified)
+// is found by verify-existing, blamed alone, and its resource re-queued.
+func TestVerifyExisting_CorruptBoundaryTail(t *testing.T) {
+	for _, boundariesOnly := range []bool{true, false} {
+		t.Run(fmt.Sprintf("boundariesOnly=%v", boundariesOnly), func(t *testing.T) {
+			files := twoFiles()
+			info, _, _ := buildTestTorrent(t, mib, files)
+			e := newStoreEnv(t, info, files)
+			bad := append([]byte(nil), files[0].bytes...)
+			copy(bad[len(bad)-50:], make([]byte, 50))
+			e.seedStored(files, map[string][]byte{"a": bad})
+			stats := e.verifyExisting(boundariesOnly)
+			rows := e.fileRows()
+			if stats.BadFiles != 1 || rows[contentKey(files[0].bytes)] || !rows[contentKey(files[1].bytes)] {
+				t.Fatalf("bad_files=%d rows=%v: want a invalidated, b kept", stats.BadFiles, rows)
+			}
+			var status Status
+			if _, err := e.db.QueryOne(pg.Scan(&status), `SELECT status FROM resource WHERE resource_id = 'ih'`); err != nil || status != StatusQueuedForStoring {
+				t.Errorf("resource status %v (%v), want queued for storing", status, err)
+			}
+		})
+	}
+}
+
+func TestVerifyExisting_CleanBoundariesUntouched(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	if stats := e.verifyExisting(true); stats.BadFiles != 0 || stats.Clean != 1 || stats.BoundaryPieces == 0 {
+		t.Fatalf("stats %+v: want clean with boundary pieces checked", stats)
+	}
+	if len(e.fileRows()) != 2 {
+		t.Fatal("clean files were removed")
+	}
+}
+
+// A hybrid's padded tail is checked with its padding zeros.
+func TestVerifyExisting_HybridPaddedTail(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildHybridTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	bad := append([]byte(nil), files[0].bytes...)
+	bad[len(bad)-1] ^= 0xFF
+	e.seedStored(files, map[string][]byte{"a": bad})
+	if stats := e.verifyExisting(true); stats.BadFiles != 1 {
+		t.Fatalf("stats %+v: want the padded tail caught", stats)
+	}
+}
+
+// With verification off, an upload whose parts are all there (the last one
+// merged) is completed as is; before, it resumed short of the end and stored
+// the tail twice.
+func TestStore_CompletePartsWithoutVerification(t *testing.T) {
+	files := []testFile{{"a", pattern(7, 12*mib+345)}}
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.w.verifyIntegrity = false
+	a := files[0].bytes
+	e.s3.uploads["u-old"] = map[int64][]byte{1: a[:5*mib], 2: a[5*mib:]}
+	if _, err := e.db.Exec(`INSERT INTO file (hash, status, upload_id, part_size, total_size) VALUES (?, 1, 'u-old', ?, ?)`, contentKey(a), 5*mib, len(a)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// A path+size candidate whose object is gone is not a match; before, the
+// failed read failed every store of the resource.
+func TestStore_DedupCandidateMissingInS3(t *testing.T) {
+	files := []testFile{{"a", pattern(8, 6*mib+3)}}
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	for _, q := range []string{
+		`INSERT INTO resource (resource_id, status) VALUES ('other-resource', 2)`,
+		`INSERT INTO file (hash, status, total_size, stored_size) VALUES ('gone', 2, ` + strconv.Itoa(len(files[0].bytes)) + `, ` + strconv.Itoa(len(files[0].bytes)) + `)`,
+		`INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('other-resource', 'gone', '/t')`,
+	} {
+		if _, err := e.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// A source hiccup while completing a boundary piece fails the attempt but keeps
+// the uploaded parts; the retry resumes instead of starting over.
+func TestStore_SourceErrorKeepsParts(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	failures := 3 // readRange's attempts
+	e.src.fail = func(name string, start, end int64) bool {
+		if name == "b" && end >= 0 && start == 0 && failures > 0 { // a's tail piece reads b's head
+			failures--
+			return true
+		}
+		return false
+	}
+	if err := e.store(); err == nil {
+		t.Fatal("want the first attempt to fail on the source read")
+	}
+	e.s3.mu.Lock()
+	kept := 0
+	for _, parts := range e.s3.uploads {
+		kept += len(parts)
+	}
+	e.s3.mu.Unlock()
+	if kept == 0 {
+		t.Fatal("the failed attempt aborted its multipart upload")
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	e.assertStored(files)
+	if got := strings.Join(e.src.opens, " "); strings.Count(got, "a@0") != 1 {
+		t.Errorf("streams %q: the retry restarted a from 0", got)
+	}
+}
+
+// When the torrent's own bytes do not hash right either, nothing is blamed:
+// deleting a stored copy the source cannot replace would only lose data.
+func TestVerifyExisting_UnreliableSourceBlamesNothing(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	bad := append([]byte(nil), files[0].bytes...)
+	copy(bad[len(bad)-50:], make([]byte, 50))
+	e.seedStored(files, map[string][]byte{"a": bad})
+	e.src.mutate = func(name string, start, end int64, data []byte) {
+		if name == "a" && end >= 0 {
+			data[len(data)-1] ^= 0x55 // the source's tail is wrong too, differently
+		}
+	}
+	stats := e.verifyExisting(true)
+	if stats.BadFiles != 0 || stats.Unresolved != 1 || len(e.fileRows()) != 2 {
+		t.Fatalf("stats %+v rows %d: want unresolved, nothing invalidated", stats, len(e.fileRows()))
+	}
 }

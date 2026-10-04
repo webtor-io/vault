@@ -4,8 +4,10 @@ import "testing"
 
 // Parts upload in parallel, so an interrupted upload can hold parts 1-10 and
 // 12 without 11. Counting all parts resumed at part 12's offset as part 13:
-// part 11's bytes were lost and part 12's stored twice, silently.
-func TestContiguousParts(t *testing.T) {
+// part 11's bytes were lost and part 12's stored twice, silently. The result is
+// bytes: a complete upload ends with the merged last part, which counted as a
+// whole part would resume short of the end and store its tail twice.
+func TestContiguousStored(t *testing.T) {
 	const p = 10
 	for _, c := range []struct {
 		name  string
@@ -14,13 +16,13 @@ func TestContiguousParts(t *testing.T) {
 		want  int64
 	}{
 		{"none", map[int64]int64{}, 55, 0},
-		{"gap after two", map[int64]int64{1: p, 2: p, 4: p}, 55, 2},
-		{"short middle part breaks the run", map[int64]int64{1: p, 2: 3, 3: p}, 55, 1},
-		{"complete with a merged final part", map[int64]int64{1: p, 2: p, 3: p, 4: p, 5: 15}, 55, 5},
-		{"final part merges the remainder", map[int64]int64{1: p, 2: 17}, 27, 2},
-		{"single small part", map[int64]int64{1: 7}, 7, 1},
+		{"gap after two", map[int64]int64{1: p, 2: p, 4: p}, 55, 20},
+		{"short middle part breaks the run", map[int64]int64{1: p, 2: 3, 3: p}, 55, 10},
+		{"complete with a merged final part", map[int64]int64{1: p, 2: p, 3: p, 4: p, 5: 15}, 55, 55},
+		{"final part merges the remainder", map[int64]int64{1: p, 2: 17}, 27, 27},
+		{"single small part", map[int64]int64{1: 7}, 7, 7},
 	} {
-		if got := contiguousParts(c.sizes, p, c.total); got != c.want {
+		if got := contiguousStored(c.sizes, p, c.total); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
 	}

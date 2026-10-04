@@ -11,7 +11,6 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/aws/aws-sdk-go/aws"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	pg "github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -172,13 +171,12 @@ func matchesTorrentPiece(ctx context.Context, s3Cl *awss3.S3, bucket, key string
 	return bytes.Equal(got[:], want.Value[:]), nil
 }
 
-// corruptPrevFiles explains a left-boundary mismatch. The piece's bytes before
-// this file came from the previous files' S3 objects; if the whole piece read
-// from the torrent instead hashes right, every previous file whose stored bytes
-// differ from the torrent's is corrupt — stored before right-boundary
-// verification existed. If the torrent's bytes do not hash right either, the
-// source is not trustworthy right now and nothing is blamed.
-func (s *Worker) corruptPrevFiles(ctx context.Context, s3Cl *awss3.S3, prev []prevFileInfo, src sourceFetcher, m *pieceMismatchError) ([]prevFileInfo, error) {
+// blameStoredFiles explains a piece mismatch on bytes read from stored S3
+// objects. If the whole piece read from the torrent instead hashes right, every
+// stored file whose bytes in the piece differ from the torrent's is corrupt
+// (stored before boundary pieces were verified). If the torrent's bytes do not
+// hash right either, the source is not trustworthy right now: nothing is blamed.
+func blameStoredFiles(ctx context.Context, s3Cl *awss3.S3, bucket string, files []prevFileInfo, src sourceFetcher, m *pieceMismatchError) ([]prevFileInfo, error) {
 	if src == nil {
 		return nil, nil
 	}
@@ -192,9 +190,9 @@ func (s *Worker) corruptPrevFiles(ctx context.Context, s3Cl *awss3.S3, prev []pr
 	if sum := sha1.Sum(fresh); !bytes.Equal(sum[:], m.Want) {
 		return nil, nil
 	}
-	fetch := newS3ByteFetcher(s3Cl, s.bucket)
+	fetch := newS3ByteFetcher(s3Cl, bucket)
 	var bad []prevFileInfo
-	for _, pf := range prev {
+	for _, pf := range files {
 		from, to := max(m.Start, pf.torrentOff), min(m.End, pf.torrentOff+pf.length)
 		if from >= to {
 			continue
@@ -208,18 +206,4 @@ func (s *Worker) corruptPrevFiles(ctx context.Context, s3Cl *awss3.S3, prev []pr
 		}
 	}
 	return bad, nil
-}
-
-// invalidateStoredFile sends a stored file back to storing, so the next store
-// of a resource holding it uploads it again instead of reusing the object.
-func invalidateStoredFile(ctx context.Context, db *pg.DB, hash string) error {
-	_, err := db.Model((*File)(nil)).Context(ctx).
-		Set("status = ?", StatusStoring).
-		Set("stored_size = 0").
-		Set("upload_id = ''").
-		Set("updated_at = now()").
-		Where("hash = ?", hash).
-		Where("status = ?", StatusStored).
-		Update()
-	return err
 }

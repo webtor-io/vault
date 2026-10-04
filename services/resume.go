@@ -16,22 +16,22 @@ func partStart(off, partSize, total int64) int64 {
 	return min(off/partSize*partSize, lastPartStart(total, partSize))
 }
 
-// contiguousParts counts the leading multipart parts 1..k that are present with
-// their expected size (partSize, or the remainder for the last part). Parts
-// upload in parallel, so an interrupted upload can hold parts after a gap;
-// counting every part would resume past the gap and drop its bytes.
-func contiguousParts(sizes map[int64]int64, partSize, total int64) int64 {
-	var k int64
-	for {
-		sz, ok := sizes[k+1]
-		if !ok || (sz != partSize && k*partSize+sz != total) {
-			return k
+// contiguousStored is how many bytes the leading multipart parts 1..k hold
+// when each is present with its expected size (partSize, or the remainder for
+// the last part). Parts upload in parallel, so an interrupted upload can hold
+// parts after a gap; counting every part would resume past the gap and drop
+// its bytes. It returns total when the run includes the last part.
+func contiguousStored(sizes map[int64]int64, partSize, total int64) int64 {
+	var stored int64
+	for n := int64(1); stored < total; n++ {
+		sz, ok := sizes[n]
+		last := stored == lastPartStart(total, partSize)
+		if !ok || (!last && sz != partSize) || (last && stored+sz != total) {
+			break
 		}
-		k++
-		if k*partSize >= total || k*partSize+sz >= total {
-			return k
-		}
+		stored += sz
 	}
+	return stored
 }
 
 // resumeOffset is the file offset an upload restarts from after `stored` bytes

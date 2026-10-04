@@ -650,7 +650,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// The verifier completes boundary pieces with bytes read from the torrent.
 	var src sourceFetcher
 	if mi != nil {
-		src = s.newSourceFetcher(cla, id, mi, fileItems)
+		src = newSourceFetcher(s.api, cla, id, mi, fileItems)
 	}
 	// Phase 2: store files sequentially using the fixed listing.
 	for _, item := range fileItems {
@@ -1088,7 +1088,8 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if err == nil && !sameResource && mi != nil {
 		ok, mErr := matchesTorrentPiece(ctx, s.s3.Get(), s.bucket, existing.Hash, mi, fileOffsetInTorrent(mi, item.PathStr, item.Size), item.Size)
 		if mErr != nil {
-			return nil, errors.Wrap(mErr, "failed to check dedup candidate against torrent")
+			// An unreadable candidate (object gone, S3 hiccup) is not a match.
+			log.WithError(mErr).WithField("hash", existing.Hash).Warn("path+size dedup candidate unreadable, storing separately")
 		}
 		if !ok {
 			log.WithFields(log.Fields{"hash": existing.Hash, "path": item.PathStr, "resource_id": id}).
@@ -1353,7 +1354,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// the part holding the start of the piece they cut, so that piece is
 	// streamed and verified whole (see resumeOffset).
 	mu.Lock()
-	stored := min(contiguousParts(partSizes, partSize, f.TotalSize)*partSize, f.TotalSize)
+	stored := contiguousStored(partSizes, partSize, f.TotalSize)
 	if stored < f.TotalSize {
 		if mi != nil {
 			stored = resumeOffset(stored, fileOff, mi.PieceLength, partSize, f.TotalSize)
@@ -1381,22 +1382,9 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	if mi != nil {
 		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket)).withSource(src)
 		if err := verifier.Bootstrap(ctx, stored); err != nil {
-			// Bootstrap pulls already-uploaded bytes through the hasher;
-			// failure means the resume prefix is corrupt (or prev files
-			// can't be read). Abort the multipart upload and reset the
-			// row so the next worker pass starts the upload fresh.
-			log.WithError(err).WithField("hash", hash).Warn("verifier bootstrap failed, aborting and resetting upload state")
-			_, _ = s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
-				Bucket:   aws.String(s.bucket),
-				Key:      aws.String(hash),
-				UploadId: aws.String(f.UploadID),
-			})
-			f.UploadID = ""
-			f.StoredSize = 0
-			f.PartSize = partSize
-			if _, dbErr := db.Model(f).Context(ctx).Column("upload_id", "stored_size", "part_size").WherePK().Update(); dbErr != nil {
-				return nil, errors.Wrap(dbErr, "failed to reset upload after verifier bootstrap failure")
-			}
+			// Bootstrap reads the previous files' bytes from S3 and seeds a
+			// cut piece from the source; a failure is I/O, not bad bytes.
+			// The uploaded parts stay: a retry resumes safely (resumeOffset).
 			return nil, errors.Wrap(err, "verifier bootstrap")
 		}
 	}
@@ -1624,9 +1612,11 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			// Cut short (shutdown, lost lease): the parts stay for resume.
 			return nil, ctx.Err()
 		}
+		// The uploaded parts stay for a resume in every failure but one (a
+		// corrupt previous file, below): a bad piece's last byte is never in
+		// an uploaded part, so resumeOffset re-reads it from its first part.
 		var m *pieceMismatchError
 		if !errors.As(err, &m) {
-			abort()
 			return nil, err
 		}
 		err = errors.Wrap(err, "integrity verification failed during upload")
@@ -1634,14 +1624,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			// Left boundary: the previous files' bytes came from S3. If the
 			// piece verifies with them read from the torrent, the stored copies
 			// that differ are corrupt; they go back to storing.
-			corrupt, hErr := s.corruptPrevFiles(ctx, s3Cl, prevFiles, src, m)
+			corrupt, hErr := blameStoredFiles(ctx, s3Cl, s.bucket, prevFiles, src, m)
 			if hErr != nil {
 				log.WithError(hErr).WithField("resource_id", id).Warn("could not check previous files after a left-boundary mismatch")
 			}
 			if len(corrupt) > 0 {
 				abort()
 				for _, pf := range corrupt {
-					if iErr := invalidateStoredFile(ctx, db, pf.hash); iErr != nil {
+					// The verify-existing treatment: drop the object and its
+					// links, re-queue the other stored owners.
+					if _, iErr := invalidateCorruptFile(ctx, db, s3Cl, s.bucket, pf.hash); iErr != nil {
 						return nil, errors.Wrapf(iErr, "failed to queue corrupt file %s for re-store", pf.hash)
 					}
 					log.WithFields(log.Fields{"resource_id": id, "hash": pf.hash, "piece": m.Piece}).
@@ -1651,7 +1643,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			}
 		}
 		if rewinds >= maxRewinds {
-			abort()
 			return nil, err
 		}
 		rewound := partStart(max(0, m.Start-fileOff), partSize, f.TotalSize)
@@ -1672,7 +1663,6 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		mu.Unlock()
 		verifier = newPieceVerifier(mi, fileOff, item.Size, prevFiles, newS3ByteFetcher(s3Cl, s.bucket)).withSource(src)
 		if bErr := verifier.Bootstrap(ctx, stored); bErr != nil {
-			abort()
 			return nil, errors.Wrap(bErr, "verifier bootstrap after rewind")
 		}
 	}
