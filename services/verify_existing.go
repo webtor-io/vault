@@ -159,6 +159,11 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 			continue
 		}
 
+		if !mi.HasV1() {
+			log.WithField("id", r.ID).Info("verify-existing: torrent has no v1 piece hashes, nothing to verify against")
+			continue
+		}
+
 		var rfs []ResourceFile
 		if err := db.Model(&rfs).Context(ctx).Where("resource_id = ?", r.ID).Select(); err != nil {
 			log.WithError(err).WithField("id", r.ID).Error("verify-existing: failed to list resource files")
@@ -193,11 +198,16 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 				continue
 			}
 			if err := verifyFileAgainstMetainfo(ctx, s3Cl, bucket, f.Hash, mi, fileOff, f.TotalSize); err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"id":   r.ID,
-					"hash": f.Hash,
-					"path": rf.Path,
-				}).Warn("verify-existing: file failed integrity check")
+				fields := log.Fields{"id": r.ID, "hash": f.Hash, "path": rf.Path}
+				// Only a piece hash mismatch is corruption. A read error is
+				// not: invalidating on it deletes a good object.
+				var m *pieceMismatchError
+				if !errors.As(err, &m) {
+					log.WithError(err).WithFields(fields).Error("verify-existing: could not check file")
+					stats.Errors++
+					continue
+				}
+				log.WithError(err).WithFields(fields).Warn("verify-existing: file failed integrity check")
 				corrupt[f.Hash] = struct{}{}
 			}
 		}

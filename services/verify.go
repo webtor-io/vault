@@ -133,7 +133,7 @@ func verifyFileAgainstMetainfo(ctx context.Context, s3Cl *awss3.S3, bucket, key 
 		}
 		want := wantOpt.Value
 		if !bytes.Equal(got, want[:]) {
-			return errors.Errorf("verify: piece %d sha1 mismatch (got=%x want=%x)", idx, got, want[:])
+			return &pieceMismatchError{Piece: idx, Start: pieceGlobal, End: pieceGlobal + pieceLen, Got: got, Want: want[:]}
 		}
 		verified++
 	}

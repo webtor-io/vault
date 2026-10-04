@@ -36,6 +36,7 @@ const mib = 1 << 20
 
 type fakeS3 struct {
 	mu      sync.Mutex
+	failGet map[string]bool // GETs of these keys answer 500
 	objects map[string][]byte
 	uploads map[string]map[int64][]byte
 	n       int
@@ -100,6 +101,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete:
 		delete(f.objects, key)
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && f.failGet[key]:
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `<Error><Code>InternalError</Code><Message>try again</Message></Error>`)
 	case r.Method == http.MethodHead || r.Method == http.MethodGet:
 		obj, ok := f.objects[key]
 		if !ok {
@@ -652,4 +656,32 @@ func TestStore_RewindLimitIsPerPiece(t *testing.T) {
 	if n != len(bad) {
 		t.Fatalf("injected %d bad reads, want %d", n, len(bad))
 	}
+}
+
+// An S3 read error is not corruption: the object stays. Before, any error from
+// the interior check deleted the object and re-queued its resources.
+func TestVerifyExisting_ReadErrorIsNotCorruption(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	e.s3.failGet = map[string]bool{contentKey(files[0].bytes): true}
+	stats := e.verifyExisting(false)
+	if stats.BadFiles != 0 || stats.Errors == 0 || len(e.fileRows()) != 2 {
+		t.Fatalf("stats %+v rows %d: want an error counted and nothing invalidated", stats, len(e.fileRows()))
+	}
+}
+
+// A pure v2 torrent has no v1 piece hashes to verify against; it is stored
+// unverified (as before verification existed) instead of failing every retry.
+func TestStore_PureV2StoredUnverified(t *testing.T) {
+	data := pattern(10, 6*mib+5)
+	info := &metainfo.Info{Name: "t", PieceLength: mib, MetaVersion: 2,
+		FileTree: metainfo.FileTree{File: metainfo.FileTreeFile{Length: int64(len(data)), PiecesRoot: string(make([]byte, 32))}}}
+	files := []testFile{{"t", data}}
+	e := newStoreEnv(t, info, files)
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
 }

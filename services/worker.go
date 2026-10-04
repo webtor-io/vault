@@ -629,11 +629,17 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		if err != nil {
 			return errors.Wrap(err, "failed to parse torrent metainfo")
 		}
-		log.WithFields(log.Fields{
-			"id":           id,
-			"num_pieces":   mi.NumPieces(),
-			"piece_length": mi.PieceLength,
-		}).Info("integrity verification enabled")
+		if !mi.HasV1() {
+			// A pure v2 torrent has no SHA-1 piece hashes to verify against.
+			log.WithField("id", id).Info("torrent has no v1 piece hashes, storing without verification")
+			mi = nil
+		} else {
+			log.WithFields(log.Fields{
+				"id":           id,
+				"num_pieces":   mi.NumPieces(),
+				"piece_length": mi.PieceLength,
+			}).Info("integrity verification enabled")
+		}
 	}
 
 	// Track (file_hash, path) pairs produced by this run so stale links
