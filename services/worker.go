@@ -1109,17 +1109,14 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		// conditions, external S3 cleanup, or multipart uploads that were
 		// marked complete in DB but never finalized in S3.
 		s3Cl := s.s3.Get()
-		_, headErr := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(existing.Hash),
-		})
+		headErr := objectHasSize(ctx, s3Cl, s.bucket, existing.Hash, existing.TotalSize)
 		if headErr == nil {
 			return &existing, nil
 		}
 		log.WithError(headErr).WithFields(log.Fields{
 			"hash": existing.Hash,
 			"path": item.PathStr,
-		}).Warn("dedup candidate marked stored but missing in S3, forcing re-upload")
+		}).Warn("dedup candidate missing in S3 or of the wrong size, forcing re-upload")
 		// Reset the stale row so the regular upload path below re-uploads it
 		// when the same content hash is recomputed via generateFileHash.
 		if _, err := db.Model(&existing).Context(ctx).
@@ -1212,15 +1209,12 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	// worker may have just inserted the row but not yet started the upload,
 	// in which case we would declare the file stored while nothing was in S3.
 	if err == nil && f.Status == StatusStored {
-		_, headErr := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(hash),
-		})
+		headErr := objectHasSize(ctx, s3Cl, s.bucket, hash, f.TotalSize)
 		if headErr == nil {
 			return f, nil
 		}
 		log.WithError(headErr).WithField("hash", hash).
-			Warn("file marked stored but missing in S3, re-uploading")
+			Warn("file marked stored but missing in S3 or of the wrong size, re-uploading")
 		// Fall through into the re-upload path below. Reset the row so the
 		// multipart upload logic starts from scratch.
 		f.Status = StatusStoring
@@ -1639,12 +1633,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 			}
 			if len(corrupt) > 0 {
 				abort()
+				// The verify-existing treatment: drop the objects and their
+				// links, re-queue the other stored owners.
+				hashes := make([]string, len(corrupt))
+				for i, pf := range corrupt {
+					hashes[i] = pf.hash
+				}
+				if _, iErr := invalidateCorruptFiles(ctx, db, s3Cl, s.bucket, hashes, id); iErr != nil {
+					return nil, errors.Wrapf(iErr, "failed to queue corrupt files %v for re-store", hashes)
+				}
 				for _, pf := range corrupt {
-					// The verify-existing treatment: drop the object and its
-					// links, re-queue the other stored owners.
-					if _, iErr := invalidateCorruptFile(ctx, db, s3Cl, s.bucket, pf.hash); iErr != nil {
-						return nil, errors.Wrapf(iErr, "failed to queue corrupt file %s for re-store", pf.hash)
-					}
 					log.WithFields(log.Fields{"resource_id": id, "hash": pf.hash, "piece": m.Piece}).
 						Warn("stored file failed boundary verification; queued for re-store")
 				}
@@ -1700,6 +1698,16 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to complete S3 multipart upload, bucket=%s, key=%s, upload_id=%s", s.bucket, hash, f.UploadID)
+	}
+	// Uploads of 04-05.02.2026 completed without their last part and were
+	// recorded stored; the object must hold the whole file.
+	if err := objectHasSize(ctx, s3Cl, s.bucket, hash, item.Size); err != nil {
+		// Only a definite short object fails the store: a retry after a
+		// failed HEAD would upload the whole file again.
+		if _, statFailed := err.(awserr.Error); !statFailed {
+			return nil, errors.Wrap(err, "completed upload")
+		}
+		log.WithError(err).WithField("key", hash).Warn("could not stat the completed upload")
 	}
 
 	// NOTE: file status intentionally stays `storing` here. The sole
@@ -1786,4 +1794,19 @@ func (s *Worker) generateFileHash(ctx context.Context, item ra.ListItem, ei *ra.
 		}
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// objectHasSize reports whether the object at key exists and holds size bytes.
+func objectHasSize(ctx context.Context, s3Cl *awss3.S3, bucket, key string, size int64) error {
+	head, err := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return err
+	}
+	if got := aws.Int64Value(head.ContentLength); head.ContentLength == nil || got != size {
+		return errors.Errorf("object %s holds %d bytes, want %d", key, got, size)
+	}
+	return nil
 }

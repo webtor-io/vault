@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
@@ -37,9 +38,17 @@ const mib = 1 << 20
 type fakeS3 struct {
 	mu      sync.Mutex
 	failGet map[string]bool // GETs of these keys answer 500
-	objects map[string][]byte
-	uploads map[string]map[int64][]byte
-	n       int
+	// afterDelete runs after an object DELETE is answered, outside the lock.
+	afterDelete func(key string)
+	// dropLastPart completes a multipart upload without its last part, as
+	// uploads did on 04-05.02.2026.
+	dropLastPart bool
+	// noHeadLength answers HEADs without a Content-Length.
+	noHeadLength bool
+	failHead     map[string]bool // HEADs of these keys answer 500
+	objects      map[string][]byte
+	uploads      map[string]map[int64][]byte
+	n            int
 }
 
 func newFakeS3() *fakeS3 {
@@ -47,10 +56,13 @@ func newFakeS3() *fakeS3 {
 }
 
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	key := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)[1]
 	q := r.URL.Query()
+	if r.Method == http.MethodDelete && !q.Has("uploadId") && f.afterDelete != nil {
+		defer f.afterDelete(key)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	id := q.Get("uploadId")
 	switch {
 	case r.Method == http.MethodPost && q.Has("uploads"):
@@ -85,6 +97,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = xml.NewDecoder(r.Body).Decode(&req)
 		var obj []byte
+		if f.dropLastPart && len(req.Parts) > 1 {
+			req.Parts = req.Parts[:len(req.Parts)-1]
+		}
 		for _, p := range req.Parts {
 			obj = append(obj, f.uploads[id][p.PartNumber]...)
 		}
@@ -101,6 +116,8 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete:
 		delete(f.objects, key)
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodHead && f.failHead[key]:
+		w.WriteHeader(http.StatusInternalServerError)
 	case r.Method == http.MethodGet && f.failGet[key]:
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprint(w, `<Error><Code>InternalError</Code><Message>try again</Message></Error>`)
@@ -113,8 +130,16 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		start, end := int64(0), int64(len(obj))-1
 		if rg := r.Header.Get("Range"); rg != "" {
 			fmt.Sscanf(rg, "bytes=%d-%d", &start, &end)
+			if start >= int64(len(obj)) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				fmt.Fprint(w, `<Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message></Error>`)
+				return
+			}
 			end = min(end, int64(len(obj))-1)
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(obj)))
+		}
+		if r.Method == http.MethodHead && f.noHeadLength {
+			return
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 		if r.Header.Get("Range") != "" {
@@ -658,6 +683,211 @@ func TestStore_RewindLimitIsPerPiece(t *testing.T) {
 	}
 }
 
+// An object shorter than its file (a multipart upload completed without its
+// last part, 04-05.02.2026) is corruption: invalidated, not an error. Before,
+// reading its boundary piece answered 416 and aborted the resource's check.
+func TestVerifyExisting_TruncatedObject(t *testing.T) {
+	for _, boundariesOnly := range []bool{true, false} {
+		t.Run(fmt.Sprintf("boundariesOnly=%v", boundariesOnly), func(t *testing.T) {
+			files := twoFiles()
+			info, _, _ := buildTestTorrent(t, mib, files)
+			e := newStoreEnv(t, info, files)
+			e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+			stats := e.verifyExisting(boundariesOnly)
+			rows := e.fileRows()
+			if stats.BadFiles != 1 || stats.Errors != 0 || stats.BoundaryPieces != 1 || rows[contentKey(files[0].bytes)] || !rows[contentKey(files[1].bytes)] {
+				t.Fatalf("stats %+v rows %v: want a invalidated, b kept and its boundary checked, no errors", stats, rows)
+			}
+			if e.s3.object(contentKey(files[0].bytes)) != nil {
+				t.Error("truncated object still in S3")
+			}
+		})
+	}
+}
+
+// A resource's corrupt files are invalidated in one transaction holding its
+// row: no worker claims it halfway and reuses a corrupt file verify-existing
+// has not reached yet. Before, the first invalidation re-queued the resource,
+// a worker reused the rest, and it ended stored with files missing.
+func TestVerifyExisting_InvalidationIsAtomic(t *testing.T) {
+	files := []testFile{{"a", pattern(1, 6*mib)}, {"b", pattern(2, 6*mib)}, {"c", pattern(3, 6*mib)}}
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:5*mib], "b": files[1].bytes[:5*mib], "c": files[2].bytes[:5*mib]})
+	var claimed []string
+	e.s3.afterDelete = func(string) {
+		res, err := e.w.tryClaim(context.Background(), e.db, "w#1", false)
+		if err != nil {
+			t.Errorf("claim: %v", err)
+		}
+		if res != nil {
+			claimed = append(claimed, res.ID)
+		}
+	}
+	stats := e.verifyExisting(true)
+	e.s3.afterDelete = nil
+	if len(claimed) != 0 {
+		t.Fatalf("a worker claimed %v while its corrupt files were being invalidated", claimed)
+	}
+	if stats.BadFiles != 3 || stats.S3Deleted != 3 || stats.Requeued != 1 || len(e.fileRows()) != 0 {
+		t.Fatalf("stats %+v rows %d: want 3 files invalidated, one resource re-queued", stats, len(e.fileRows()))
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("re-store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// An owner in the middle of a store may already have linked the corrupt file:
+// deleting it under that owner left it stored without the file. The file is
+// left for a later sweep instead, counted as an error.
+func TestVerifyExisting_BusyOwnerBlocksInvalidation(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+	keyA := contentKey(files[0].bytes)
+	if _, err := e.db.Exec(`INSERT INTO resource (resource_id, status) VALUES ('r2', ?)`, StatusStoring); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(`INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('r2', ?, '/t/a')`, keyA); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.verifyExisting(true)
+	var links int
+	if _, err := e.db.QueryOne(pg.Scan(&links), `SELECT count(*) FROM resource_file WHERE file_hash = ?`, keyA); err != nil {
+		t.Fatal(err)
+	}
+	var status Status
+	if _, err := e.db.QueryOne(pg.Scan(&status), `SELECT status FROM resource WHERE resource_id = 'ih'`); err != nil {
+		t.Fatal(err)
+	}
+	if stats.BadFiles != 1 || stats.S3Deleted != 0 || stats.Errors == 0 || links != 2 || e.s3.object(keyA) == nil || status != StatusStored {
+		t.Fatalf("stats %+v links %d ih %v: want a detected but kept for both owners, ih untouched", stats, links, status)
+	}
+}
+
+// A HEAD without a Content-Length gives no size; it is an error, not a size
+// of 0 that makes every good file look truncated and deletes it.
+func TestVerifyExisting_UnknownSizeIsNotCorruption(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	e.s3.noHeadLength = true
+	stats := e.verifyExisting(true)
+	if stats.BadFiles != 0 || stats.Errors == 0 || len(e.fileRows()) != 2 {
+		t.Fatalf("stats %+v rows %d: want errors and both files kept", stats, len(e.fileRows()))
+	}
+}
+
+// An owner nobody is working on (failed, queued) does not block: it loses the
+// link and stores the file again when it runs. Blocking on it left the file
+// corrupt for good, and two such owners refused each other forever.
+func TestVerifyExisting_IdleCoOwnerDoesNotBlock(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+	keyA := contentKey(files[0].bytes)
+	if _, err := e.db.Exec(`INSERT INTO resource (resource_id, status) VALUES ('r2', ?)`, StatusStoreError); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(`INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('r2', ?, '/t/a')`, keyA); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.verifyExisting(true)
+	var r2 Status
+	if _, err := e.db.QueryOne(pg.Scan(&r2), `SELECT status FROM resource WHERE resource_id = 'r2'`); err != nil {
+		t.Fatal(err)
+	}
+	if stats.S3Deleted != 1 || stats.Requeued != 1 || e.fileRows()[keyA] || r2 != StatusStoreError {
+		t.Fatalf("stats %+v r2 %v: want a invalidated, ih re-queued, r2 left to its retry", stats, r2)
+	}
+}
+
+// A file row a worker is re-uploading (it found the object bad) is left to
+// that upload, which fixes the object for every owner.
+func TestVerifyExisting_FileBeingReuploadedLeftAlone(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+	keyA := contentKey(files[0].bytes)
+	if _, err := e.db.Exec(`UPDATE file SET status = ? WHERE hash = ?`, StatusStoring, keyA); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.verifyExisting(true)
+	if stats.S3Deleted != 0 || stats.Errors == 0 || !e.fileRows()[keyA] {
+		t.Fatalf("stats %+v: want a left to its re-upload", stats)
+	}
+}
+
+// A link committed while verify-existing runs is not cascaded away unseen:
+// the file rows are locked first, so the owner set is read after it.
+func TestVerifyExisting_FileRowLockKeepsInFlightLink(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+	keyA := contentKey(files[0].bytes)
+	if _, err := e.db.Exec(`INSERT INTO resource (resource_id, status) VALUES ('r2', ?)`, StatusStoring); err != nil {
+		t.Fatal(err)
+	}
+	// r2's worker finalizing a: UPDATE file, then INSERT the link, one tx.
+	tx, err := e.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE file SET status = ? WHERE hash = ?`, StatusStored, keyA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('r2', ?, '/t/a')`, keyA); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan VerifyExistingStats)
+	go func() { done <- e.verifyExisting(true) }()
+	time.Sleep(300 * time.Millisecond)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	var links int
+	if _, err := e.db.QueryOne(pg.Scan(&links), `SELECT count(*) FROM resource_file WHERE resource_id = 'r2'`); err != nil {
+		t.Fatal(err)
+	}
+	if links != 1 {
+		t.Fatal("storing r2's committed link to a was cascaded away")
+	}
+}
+
+// A stored file whose object is gone is corruption: its owners serve a 404,
+// and it is what an invalidation leaves when its commit fails after the
+// deletes.
+func TestVerifyExisting_MissingObjectIsCorrupt(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	delete(e.s3.objects, contentKey(files[0].bytes))
+	if stats := e.verifyExisting(true); stats.BadFiles != 1 || stats.Requeued != 1 || len(e.fileRows()) != 1 {
+		t.Fatalf("stats %+v: want a invalidated and ih re-queued", stats)
+	}
+}
+
+// A HEAD that fails is an error, not corruption: a transient S3 error must not
+// delete good files.
+func TestVerifyExisting_HeadErrorIsNotCorruption(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	e.s3.failHead = map[string]bool{contentKey(files[0].bytes): true}
+	if stats := e.verifyExisting(true); stats.BadFiles != 0 || stats.Errors == 0 || stats.Clean != 0 || len(e.fileRows()) != 2 {
+		t.Fatalf("stats %+v: want an error, nothing invalidated, not clean", stats)
+	}
+}
+
 // An S3 read error is not corruption: the object stays. Before, any error from
 // the interior check deleted the object and re-queued its resources.
 func TestVerifyExisting_ReadErrorIsNotCorruption(t *testing.T) {
@@ -667,9 +897,76 @@ func TestVerifyExisting_ReadErrorIsNotCorruption(t *testing.T) {
 	e.seedStored(files, nil)
 	e.s3.failGet = map[string]bool{contentKey(files[0].bytes): true}
 	stats := e.verifyExisting(false)
-	if stats.BadFiles != 0 || stats.Errors == 0 || len(e.fileRows()) != 2 {
-		t.Fatalf("stats %+v rows %d: want an error counted and nothing invalidated", stats, len(e.fileRows()))
+	if stats.BadFiles != 0 || stats.Errors == 0 || stats.Clean != 0 || len(e.fileRows()) != 2 {
+		t.Fatalf("stats %+v rows %d: want an error counted, nothing invalidated, not clean", stats, len(e.fileRows()))
 	}
+}
+
+// A truncated object is not reused when its resource is stored again: dedup
+// compares the object's size, not only that it exists.
+func TestStore_TruncatedObjectNotReused(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, map[string][]byte{"a": files[0].bytes[:10*mib]})
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// The content-hash dedup checks the object's size too: a stored row reached
+// by hash alone (no path match) with a truncated object is uploaded again.
+func TestStore_HashDedupChecksSize(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	keyA := contentKey(files[0].bytes)
+	e.s3.objects[keyA] = files[0].bytes[:10*mib]
+	if _, err := e.db.Exec(`INSERT INTO file (hash, status, total_size, stored_size) VALUES (?, ?, ?, ?)`, keyA, StatusStored, len(files[0].bytes), len(files[0].bytes)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// A HEAD failing after the upload completed does not fail the store: the
+// retry would upload the whole file again.
+func TestStore_StatErrorAfterCompleteKeepsUpload(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.s3.failHead = map[string]bool{contentKey(files[0].bytes): true}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// A multipart upload that completes into an object shorter than the file
+// fails the store; before, such objects were recorded stored.
+func TestStore_ShortCompletedObjectFails(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.s3.dropLastPart = true
+	if err := e.store(); err == nil {
+		t.Fatal("store succeeded although S3 holds a short object")
+	}
+	var linked int
+	if _, err := e.db.QueryOne(pg.Scan(&linked), `SELECT count(*) FROM resource_file`); err != nil {
+		t.Fatal(err)
+	}
+	if linked != 0 {
+		t.Fatalf("%d files linked after a short upload", linked)
+	}
+	e.s3.dropLastPart = false
+	if err := e.store(); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	e.assertStored(files)
 }
 
 // A pure v2 torrent has no v1 piece hashes to verify against; it is stored

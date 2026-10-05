@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"net/http"
 
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	pg "github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
@@ -171,6 +173,7 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 			continue
 		}
 
+		errs := stats.Errors
 		corrupt := make(map[string]struct{})
 		var stored []prevFileInfo
 		for _, rf := range rfs {
@@ -191,6 +194,40 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 					"size": f.TotalSize,
 				}).Warn("verify-existing: file not found in metainfo, skipping")
 				stats.Errors++
+				continue
+			}
+			head, err := s3Cl.HeadObjectWithContext(ctx, &awss3.HeadObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(f.Hash),
+			})
+			if reqErr, ok := err.(awserr.RequestFailure); ok && reqErr.StatusCode() == http.StatusNotFound {
+				// Linked and stored but gone: users get a 404. Also what an
+				// invalidation leaves if its commit fails after the deletes.
+				log.WithFields(log.Fields{"id": r.ID, "hash": f.Hash, "path": rf.Path}).Warn("verify-existing: stored file has no object")
+				corrupt[f.Hash] = struct{}{}
+				continue
+			}
+			if err != nil {
+				log.WithError(err).WithFields(log.Fields{"id": r.ID, "hash": f.Hash}).Error("verify-existing: could not stat object")
+				stats.Errors++
+				continue
+			}
+			if head.ContentLength == nil {
+				log.WithFields(log.Fields{"id": r.ID, "hash": f.Hash}).Error("verify-existing: object size unknown")
+				stats.Errors++
+				continue
+			}
+			// A size mismatch is as definite as a hash mismatch: multipart
+			// uploads of 04-05.02.2026 completed without their last part.
+			if got := *head.ContentLength; got != f.TotalSize {
+				log.WithFields(log.Fields{
+					"id":          r.ID,
+					"hash":        f.Hash,
+					"path":        rf.Path,
+					"size":        f.TotalSize,
+					"object_size": got,
+				}).Warn("verify-existing: stored object size differs from the file")
+				corrupt[f.Hash] = struct{}{}
 				continue
 			}
 			stored = append(stored, prevFileInfo{torrentOff: fileOff, length: f.TotalSize, hash: f.Hash})
@@ -225,7 +262,10 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 		}
 
 		if len(corrupt) == 0 {
-			stats.Clean++
+			// A resource with a file left unchecked is not clean.
+			if stats.Errors == errs {
+				stats.Clean++
+			}
 			continue
 		}
 		stats.Corrupt++
@@ -240,16 +280,18 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 			continue
 		}
 
-		for hash := range corrupt {
-			affected, err := invalidateCorruptFile(ctx, db, s3Cl, bucket, hash)
-			if err != nil {
-				log.WithError(err).WithField("hash", hash).Error("verify-existing: failed to invalidate corrupt file")
-				stats.Errors++
-				continue
-			}
-			stats.S3Deleted++
-			stats.Requeued += affected
+		hashes := make([]string, 0, len(corrupt))
+		for h := range corrupt {
+			hashes = append(hashes, h)
 		}
+		requeued, err := invalidateCorruptFiles(ctx, db, s3Cl, bucket, hashes, "")
+		if err != nil {
+			log.WithError(err).WithField("id", r.ID).Error("verify-existing: failed to invalidate corrupt files")
+			stats.Errors++
+			continue
+		}
+		stats.S3Deleted += len(hashes)
+		stats.Requeued += requeued
 	}
 
 	log.WithFields(log.Fields{
@@ -384,53 +426,84 @@ func checkBoundaryPieces(ctx context.Context, s3Cl *awss3.S3, bucket string, mi 
 	return checked, bad, unresolved, nil
 }
 
-// invalidateCorruptFile removes a corrupt File row, every resource_file
-// link to it, and the S3 object — then flips every owning Resource to
-// queued_for_storing so workers re-store from a fixed seeder.
+// invalidateCorruptFiles drops corrupt files -- their File rows, every
+// resource_file link to them (ON DELETE CASCADE) and their S3 objects -- and
+// flips their stored owners to queued_for_storing, all in one transaction.
+//
+// The file rows are locked first: a worker finalizing a link to one of them
+// waits, then fails on the foreign key and retries. The owners are locked
+// next, so no worker claims one halfway (tryClaim skips locked rows) and
+// reuses a file not yet dropped. An owner other than self that a worker is
+// storing or deleting may already be using a file, and a file row that is not
+// stored is being re-uploaded; then nothing is dropped and the caller retries
+// later. self, the resource a worker is storing, is neither checked nor
+// re-queued: its store fails and is retried.
 //
 // Returns the number of resources re-queued.
-func invalidateCorruptFile(ctx context.Context, db *pg.DB, s3Cl *awss3.S3, bucket, hash string) (int, error) {
-	var owners []ResourceFile
-	if err := db.Model(&owners).Context(ctx).Where("file_hash = ?", hash).Select(); err != nil {
-		return 0, errors.Wrap(err, "list owning resource_files")
-	}
-
-	if err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
-		for _, rf := range owners {
-			if _, err := tx.Model((*Resource)(nil)).
-				Set("status = ?", StatusQueuedForStoring).
-				Set("error = ?", "queued for re-store: integrity check failed for hash "+hash).
-				Set("claim_expires_at = NULL").
-				Set("claimed_by = NULL").
-				Set("updated_at = now()").
-				Where("resource_id = ?", rf.ResourceID).
-				Where("status = ?", StatusStored).
-				Update(); err != nil {
-				return errors.Wrap(err, "requeue resource")
+func invalidateCorruptFiles(ctx context.Context, db *pg.DB, s3Cl *awss3.S3, bucket string, hashes []string, self string) (int, error) {
+	requeued := 0
+	err := db.RunInTransaction(ctx, func(tx *pg.Tx) error {
+		var reuploading int
+		if _, err := tx.QueryOneContext(ctx, pg.Scan(&reuploading), `
+			SELECT count(*) FILTER (WHERE status <> ?)
+			FROM (SELECT status FROM file WHERE hash IN (?) ORDER BY hash FOR UPDATE) f`,
+			StatusStored, pg.In(hashes)); err != nil {
+			return errors.Wrap(err, "lock file rows")
+		}
+		if reuploading > 0 {
+			// A worker found the object bad and is uploading it again; that
+			// fixes it for every owner.
+			return errors.New("a file is being re-uploaded")
+		}
+		var owners []Resource
+		if _, err := tx.QueryContext(ctx, &owners, `
+			SELECT * FROM resource
+			WHERE resource_id IN (SELECT resource_id FROM resource_file WHERE file_hash IN (?))
+			  AND resource_id <> ?
+			ORDER BY resource_id
+			FOR UPDATE`, pg.In(hashes), self); err != nil {
+			return errors.Wrap(err, "lock owning resources")
+		}
+		ids := make([]string, 0, len(owners))
+		for _, o := range owners {
+			switch o.Status {
+			case StatusStoring, StatusDeleting:
+				return errors.Errorf("owner %s is %v: it may be using the file", o.ID, o.Status)
+			case StatusStored:
+				ids = append(ids, o.ID)
+			}
+			// An idle owner (queued, failed) loses the link and stores the
+			// file again from scratch when it runs.
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file WHERE hash IN (?)`, pg.In(hashes)); err != nil {
+			return errors.Wrap(err, "delete file rows")
+		}
+		if len(ids) > 0 {
+			res, err := tx.ExecContext(ctx, `
+				UPDATE resource
+				SET status = ?, error = ?, claim_expires_at = NULL, claimed_by = NULL, updated_at = now()
+				WHERE resource_id IN (?) AND status = ?`,
+				StatusQueuedForStoring, "queued for re-store: integrity check failed", pg.In(ids), StatusStored)
+			if err != nil {
+				return errors.Wrap(err, "requeue owning resources")
+			}
+			requeued = res.RowsAffected()
+		}
+		// Deleted while the owners are locked, so no owner's re-upload of the
+		// same key can complete first. A failed delete leaves an object no
+		// row links; the re-store overwrites it.
+		for _, h := range hashes {
+			if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(h),
+			}); err != nil {
+				log.WithError(err).WithField("hash", h).Warn("S3 delete of a corrupt file failed; its rows are dropped anyway")
 			}
 		}
-		if _, err := tx.Model((*ResourceFile)(nil)).
-			Where("file_hash = ?", hash).
-			Delete(); err != nil {
-			return errors.Wrap(err, "delete resource_file")
-		}
-		if _, err := tx.Model(&File{Hash: hash}).WherePK().Delete(); err != nil && !errors.Is(err, pg.ErrNoRows) {
-			return errors.Wrap(err, "delete file row")
-		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return 0, err
 	}
-
-	if _, err := s3Cl.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(hash),
-	}); err != nil {
-		// DB is already invalidated; the S3 object is now an orphan that
-		// the bucket lifecycle rule cleans up. Surface as warning, not
-		// fatal — the resource has been re-queued either way.
-		log.WithError(err).WithField("hash", hash).Warn("verify-existing: S3 delete failed; will rely on lifecycle rule")
-	}
-
-	return len(owners), nil
+	return requeued, nil
 }
