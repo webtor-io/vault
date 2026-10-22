@@ -1,6 +1,6 @@
 module github.com/webtor-io/vault
 
-go 1.26
+go 1.27
 
 require (
 	github.com/anacrolix/torrent v1.60.1-0.20251217073903-486bcbe758e0
