@@ -759,8 +759,12 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		return errors.Wrap(err, "failed to update resource status to stored")
 	}
 	if result.RowsAffected() == 0 {
+		cur, err := ResourceGetByID(ctx, db, id)
+		if err != nil {
+			return errors.Wrap(err, "resource left storing during the store, not marking it stored; failed to load it")
+		}
 		state := "gone"
-		if cur, err := ResourceGetByID(ctx, db, id); err == nil && cur != nil {
+		if cur != nil {
 			state = cur.Status.String()
 		}
 		return errors.Errorf("resource left storing during the store (now %s), not marking it stored", state)
@@ -981,10 +985,25 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 		}
 	}
 
+	// Only from deleting: PUT /resource during the deletion turns the row to
+	// queued_for_storing and answers that the store is queued. Deleted, the
+	// row took that answer back; kept, the worker stores it again. A row
+	// already gone is the deletion's goal: another worker finished it after
+	// taking our lease, or DELETE /resource dropped the queued store.
 	res := &Resource{ID: id}
-	_, err = db.Model(res).Context(ctx).WherePK().Delete()
+	result, err := db.Model(res).Context(ctx).WherePK().Where("status = ?", StatusDeleting).Delete()
 	if err != nil {
 		return errors.Wrap(err, "failed to delete resource from database")
+	}
+	if result.RowsAffected() == 0 {
+		cur, err := ResourceGetByID(ctx, db, id)
+		if err != nil {
+			return errors.Wrap(err, "resource left deleting during the deletion; failed to load it")
+		}
+		if cur != nil {
+			return errors.Errorf("resource left deleting during the deletion (now %s), not deleting it", cur.Status)
+		}
+		log.WithField("resource_id", id).Info("resource row already gone at the end of the deletion")
 	}
 
 	// Best-effort orphan sweep: clean up `file` rows that have no

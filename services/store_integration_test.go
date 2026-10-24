@@ -1025,3 +1025,73 @@ func TestStore_DeletionQueuedDuringUploadWins(t *testing.T) {
 		}
 	}
 }
+
+// A store queued while the resource is being deleted (PUT /resource during
+// it) wins: the deletion keeps the row and the worker stores it again.
+// Before, the deletion removed the row and the request with it.
+func TestDelete_StoreQueuedDuringDeletionWins(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	if _, err := e.db.Exec(`UPDATE resource SET status = ? WHERE resource_id = 'ih'`, StatusDeleting); err != nil {
+		t.Fatal(err)
+	}
+	queued := false
+	e.s3.afterDelete = func(string) {
+		if !queued {
+			queued = true
+			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := e.w.handleDelete(context.Background(), e.db, "ih"); err == nil || !strings.Contains(err.Error(), "queued_for_storing") {
+		t.Fatalf("delete: want it to keep the queued store, got %v", err)
+	}
+	e.s3.afterDelete = nil
+	res, err := e.w.tryClaim(context.Background(), e.db, "pod-a#0", false)
+	if err != nil || res == nil || res.Status != StatusStoring {
+		t.Fatalf("claim after the deletion = %+v (%v), want the store", res, err)
+	}
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+}
+
+// A row gone by the end of the deletion (PUT then DELETE /resource during it,
+// or another worker that took the lease and finished) is a finished
+// deletion, not a failure.
+func TestDelete_RowGoneMeanwhileIsDone(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	if _, err := e.db.Exec(`UPDATE resource SET status = ? WHERE resource_id = 'ih'`, StatusDeleting); err != nil {
+		t.Fatal(err)
+	}
+	gone := false
+	e.s3.afterDelete = func(string) {
+		if !gone {
+			gone = true
+			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih"); err != nil {
+				t.Error(err)
+			}
+			if _, err := ResourceQueueForDeletion(context.Background(), e.db, "ih"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := e.w.handleDelete(context.Background(), e.db, "ih"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if cur, err := ResourceGetByID(context.Background(), e.db, "ih"); err != nil || cur != nil {
+		t.Fatalf("resource after the deletion = %+v (%v), want it gone", cur, err)
+	}
+	for _, f := range files {
+		if e.s3.object(contentKey(f.bytes)) != nil {
+			t.Errorf("%s: object left in S3 after the deletion", f.name)
+		}
+	}
+}
