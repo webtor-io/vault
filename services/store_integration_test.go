@@ -288,7 +288,15 @@ func newStoreEnv(t *testing.T, info *metainfo.Info, files []testFile) *storeEnv 
 	return &storeEnv{t: t, db: db, s3: s3srv, src: ft, w: w}
 }
 
-func (e *storeEnv) store() error { return e.w.handleStore(context.Background(), e.db, "ih") }
+// store runs handleStore as the worker does: on the row a claim flipped to
+// storing.
+func (e *storeEnv) store() error {
+	e.t.Helper()
+	if _, err := e.db.Exec(`UPDATE resource SET status = ? WHERE resource_id = 'ih'`, StatusStoring); err != nil {
+		e.t.Fatal(err)
+	}
+	return e.w.handleStore(context.Background(), e.db, "ih")
+}
 
 // contentKey is the S3 key vault derives for a file (generateFileHash).
 func contentKey(data []byte) string {
@@ -981,4 +989,39 @@ func TestStore_PureV2StoredUnverified(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	e.assertStored(files)
+}
+
+// A deletion queued while the files upload (a ban mid-store) wins: the store
+// does not mark the resource stored, and the deletion that follows removes
+// every object it uploaded. Before, the final UPDATE turned
+// queued_for_deletion back into stored and the copy stayed.
+func TestStore_DeletionQueuedDuringUploadWins(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	queued := false
+	e.src.mutate = func(name string, start, end int64, data []byte) {
+		if name == "b" && !queued {
+			queued = true
+			if _, err := ResourceQueueForDeletion(context.Background(), e.db, "ih"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := e.store(); err == nil || !strings.Contains(err.Error(), "queued_for_deletion") {
+		t.Fatalf("store: want it to leave the queued deletion alone, got %v", err)
+	}
+	e.assertStored(files)
+	res, err := e.w.tryClaim(context.Background(), e.db, "pod-a#0", false)
+	if err != nil || res == nil || res.Status != StatusDeleting {
+		t.Fatalf("claim after the store = %+v (%v), want the deletion", res, err)
+	}
+	if err := e.w.handleDelete(context.Background(), e.db, "ih"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for _, f := range files {
+		if e.s3.object(contentKey(f.bytes)) != nil {
+			t.Errorf("%s: object left in S3 after the deletion", f.name)
+		}
+	}
 }

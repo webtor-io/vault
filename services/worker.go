@@ -743,14 +743,27 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 		}
 	}
 
+	// Only from storing: a deletion queued during the upload (DELETE
+	// /resource, resource.banned) must win. Overwritten, it was lost with
+	// its event already acked, and the copy stayed for good; the heartbeat
+	// notices the change only on its next tick. Every file above is linked
+	// in resource_file, so the deletion removes them all.
 	res := &Resource{ID: id, Status: StatusStored}
-	_, err = db.Model(res).
+	result, err := db.Model(res).
 		Context(ctx).
 		Column("status").
 		Where("resource_id = ?", id).
+		Where("status = ?", StatusStoring).
 		Update()
 	if err != nil {
 		return errors.Wrap(err, "failed to update resource status to stored")
+	}
+	if result.RowsAffected() == 0 {
+		state := "gone"
+		if cur, err := ResourceGetByID(ctx, db, id); err == nil && cur != nil {
+			state = cur.Status.String()
+		}
+		return errors.Errorf("resource left storing during the store (now %s), not marking it stored", state)
 	}
 	return nil
 }
