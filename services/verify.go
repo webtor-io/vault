@@ -21,16 +21,18 @@ import (
 // "/"-joined path components. For multi-file torrents the path also
 // carries the root directory (Info.Name) as its first component, so we
 // strip that before matching against Info.Files[i].Path. Single-file
-// torrents match the trimmed path directly against Info.Name.
+// torrents match the trimmed path directly against Info.Name; for a v2 or
+// hybrid single-file torrent the listing walks the file tree, whose only
+// key is the name again, so the path arrives as "Name/Name".
 func fileOffsetInTorrent(mi *metainfo.Info, pathStr string, length int64) int64 {
 	trimmed := strings.TrimPrefix(pathStr, "/")
+	withoutRoot := strings.TrimPrefix(trimmed, mi.Name+"/")
 	if len(mi.Files) == 0 {
-		if trimmed == mi.Name {
+		if trimmed == mi.Name || withoutRoot == mi.Name {
 			return 0
 		}
 		return -1
 	}
-	withoutRoot := strings.TrimPrefix(trimmed, mi.Name+"/")
 	var off int64
 	for _, f := range mi.Files {
 		joined := strings.Join(f.Path, "/")
