@@ -94,10 +94,15 @@ func RegisterApiFlags(f []cli.Flag) []cli.Flag {
 	)
 }
 
+// ErrPrivateTorrent is rest-api's 403 code=private_torrent: the token's uid
+// has no tracker record for this private torrent. Another uid may have one.
+var ErrPrivateTorrent = errors.New("private torrent")
+
 type Claims struct {
 	jwt.RegisteredClaims
 	Rate          string `json:"rate,omitempty"`
 	Role          string `json:"role,omitempty"`
+	Uid           string `json:"uid,omitempty"`
 	SessionID     string `json:"sessionID"`
 	Agent         string `json:"agent"`
 	RemoteAddress string `json:"remoteAddress"`
@@ -241,6 +246,14 @@ func (s *Api) doRequest(ctx context.Context, c *Claims, url string, method strin
 	} else if res.StatusCode == http.StatusNotFound {
 		return nil
 	} else if res.StatusCode == http.StatusForbidden {
+		// The pinned rest-api module's ErrorResponse has no code or reason.
+		var e struct {
+			Code   string `json:"code"`
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(body, &e) == nil && e.Code == "private_torrent" {
+			return errors.Wrapf(ErrPrivateTorrent, "reason=%s", e.Reason)
+		}
 		return errors.Errorf("access is forbidden url=%v", url)
 	} else {
 		var e ra.ErrorResponse
