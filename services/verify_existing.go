@@ -144,8 +144,6 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 		"dry_run":   opts.DryRun,
 	}).Info("verify-existing: starting sweep")
 
-	cla := &Claims{Role: "vault"}
-
 	for ri := range resources {
 		r := &resources[ri]
 		stats.BytesScanned += r.TotalSize
@@ -154,7 +152,7 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 			"total_size": r.TotalSize,
 		}).Info("verify-existing: scanning resource")
 
-		mi, items, err := fetchMetainfoForResource(ctx, api, cla, r.ID)
+		mi, items, cla, err := fetchMetainfoForResource(ctx, api, r.ID, r.UIDs)
 		if err != nil {
 			log.WithError(err).WithField("id", r.ID).Error("verify-existing: failed to fetch metainfo, skipping")
 			stats.Errors++
@@ -307,42 +305,30 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 	return stats, nil
 }
 
-// fetchMetainfoForResource lists the resource's files and pulls the .torrent
-// via the export URL of its first file.
-func fetchMetainfoForResource(ctx context.Context, api *Api, cla *Claims, resourceID string) (*metainfo.Info, []ra.ListItem, error) {
-	listArgs := &ListResourceContentArgs{Limit: 100}
-	var items []ra.ListItem
-	for {
-		resp, err := api.ListResourceContent(ctx, cla, resourceID, listArgs)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "list resource content")
-		}
-		for _, it := range resp.Items {
-			if it.Type == ra.ListTypeFile {
-				items = append(items, it)
-			}
-		}
-		if len(resp.Items) < int(listArgs.Limit) {
-			break
-		}
-		listArgs.Offset += listArgs.Limit
+// fetchMetainfoForResource lists the resource's files as a pledger
+// (listAsPledger) and pulls the .torrent via the export URL of its first
+// file. The returned claims are the ones that listed.
+func fetchMetainfoForResource(ctx context.Context, api *Api, resourceID string, uids []string) (*metainfo.Info, []ra.ListItem, *Claims, error) {
+	cla, items, err := listAsPledger(ctx, api, resourceID, uids)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "list resource content")
 	}
 	if len(items) == 0 {
-		return nil, nil, errors.New("no file items in resource listing")
+		return nil, nil, nil, errors.New("no file items in resource listing")
 	}
 	ei, err := api.ExportResourceContent(ctx, cla, resourceID, items[0].ID)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "export resource content")
+		return nil, nil, nil, errors.Wrap(err, "export resource content")
 	}
 	raw, err := api.FetchTorrent(ctx, ei.ExportItems["download"].URL, resourceID)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "fetch torrent")
+		return nil, nil, nil, errors.Wrap(err, "fetch torrent")
 	}
 	mi, err := parseMetainfo(raw)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "parse metainfo")
+		return nil, nil, nil, errors.Wrap(err, "parse metainfo")
 	}
-	return mi, items, nil
+	return mi, items, cla, nil
 }
 
 // checkBoundaryPieces verifies, for every stored file that does not end on a

@@ -33,9 +33,9 @@ var (
 // @contact.email  support@webtor.io
 
 const (
-	webHostFlag     = "host"
-	webPortFlag     = "port"
-	s3CacheURLFlag  = "s3-cache-url"
+	webHostFlag    = "host"
+	webPortFlag    = "port"
+	s3CacheURLFlag = "s3-cache-url"
 )
 
 func RegisterWebFlags(f []cli.Flag) []cli.Flag {
@@ -94,12 +94,18 @@ func (s *Web) Serve() error {
 	if err != nil {
 		return errors.Wrap(err, "Failed to web listen to tcp connection")
 	}
+	log.Infof("serving Web at %v", addr)
+	return s.gs.Serve(&http.Server{Handler: s.router()}, ln)
+}
+
+func (s *Web) router() *gin.Engine {
 	r := gin.Default()
 	r.UseRawPath = true
 	r.Use(s.errorHandler)
 	rg := r.Group("/resource")
 
 	rg.PUT("/:id", s.putResource)
+	rg.PUT("/:id/uids", s.putResourceUIDs)
 	rg.GET("/:id", s.getResource)
 	rg.DELETE("/:id", s.deleteResource)
 	// files listing endpoint is not needed per requirements
@@ -110,9 +116,7 @@ func (s *Web) Serve() error {
 	// Swagger UI
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler, ginSwagger.InstanceName("vault")))
 	docs.SwaggerInfovault.BasePath = "/"
-
-	log.Infof("serving Web at %v", addr)
-	return s.gs.Serve(&http.Server{Handler: r}, ln)
+	return r
 }
 
 func (s *Web) errorHandler(c *gin.Context) {
