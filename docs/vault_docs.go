@@ -56,7 +56,10 @@ const docTemplatevault = `{
                 }
             },
             "put": {
-                "description": "Creates the resource if missing or marks it queued for processing",
+                "description": "Creates the resource if missing or marks it queued for processing. A non-empty uids replaces the pledgers' uids; no body or an empty list leaves them",
+                "consumes": [
+                    "application/json"
+                ],
                 "tags": [
                     "resource"
                 ],
@@ -68,6 +71,14 @@ const docTemplatevault = `{
                         "name": "id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "description": "Pledgers' uids",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/services.UIDsRequest"
+                        }
                     }
                 ],
                 "responses": {
@@ -75,6 +86,12 @@ const docTemplatevault = `{
                         "description": "Accepted",
                         "schema": {
                             "$ref": "#/definitions/services.Resource"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
                         }
                     },
                     "500": {
@@ -104,6 +121,62 @@ const docTemplatevault = `{
                         "description": "Accepted",
                         "schema": {
                             "$ref": "#/definitions/services.Resource"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/resource/{id}/uids": {
+            "put": {
+                "description": "Replaces the uids the worker signs with, keeping their order. The status is not changed and a missing resource is not created. {}, null and [] clear the list",
+                "consumes": [
+                    "application/json"
+                ],
+                "tags": [
+                    "resource"
+                ],
+                "summary": "Replace the pledgers' uids of a resource",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Resource ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Pledgers' uids",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/services.UIDsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/services.Resource"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
                         }
                     },
                     "500": {
@@ -235,6 +308,13 @@ const docTemplatevault = `{
                 "total_size": {
                     "type": "integer"
                 },
+                "uids": {
+                    "description": "Pledgers' uids (migration 9) in the order the worker tries them.\nNULL: no pledgers.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "updated_at": {
                     "type": "string"
                 }
@@ -261,6 +341,17 @@ const docTemplatevault = `{
                 "StatusDeleting",
                 "StatusDeleteError"
             ]
+        },
+        "services.UIDsRequest": {
+            "type": "object",
+            "properties": {
+                "uids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
         }
     }
 }`

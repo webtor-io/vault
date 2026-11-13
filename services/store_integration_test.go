@@ -244,6 +244,28 @@ type storeEnv struct {
 	w   *Worker
 }
 
+// testPGContext is a cli context whose PG flags point at VAULT_TEST_PG_DSN;
+// extraArgs set the S3 flags.
+func testPGContext(t *testing.T, extraArgs ...string) *cli.Context {
+	t.Helper()
+	dsn, _ := url.Parse(os.Getenv("VAULT_TEST_PG_DSN"))
+	pass, _ := dsn.User.Password()
+	app := cli.NewApp()
+	app.Flags = cs.RegisterS3ClientFlags(cs.RegisterPGFlags(nil))
+	set := flag.NewFlagSet("t", flag.ContinueOnError)
+	for _, f := range app.Flags {
+		f.Apply(set)
+	}
+	if err := set.Parse(append([]string{
+		"--postgres-host=" + dsn.Hostname(), "--postgres-port=" + dsn.Port(),
+		"--postgres-user=" + dsn.User.Username(), "--postgres-password=" + pass,
+		"--postgres-database=" + strings.TrimPrefix(dsn.Path, "/"),
+	}, extraArgs...)); err != nil {
+		t.Fatal(err)
+	}
+	return cli.NewContext(app, set, nil)
+}
+
 func newStoreEnv(t *testing.T, info *metainfo.Info, files []testFile) *storeEnv {
 	t.Helper()
 	db := testDB(t)
@@ -254,24 +276,10 @@ func newStoreEnv(t *testing.T, info *metainfo.Info, files []testFile) *storeEnv 
 	apihs := httptest.NewServer(ft)
 	t.Cleanup(apihs.Close)
 
-	dsn, _ := url.Parse(os.Getenv("VAULT_TEST_PG_DSN"))
-	pass, _ := dsn.User.Password()
-	app := cli.NewApp()
-	app.Flags = cs.RegisterS3ClientFlags(cs.RegisterPGFlags(nil))
-	set := flag.NewFlagSet("t", flag.ContinueOnError)
-	for _, f := range app.Flags {
-		f.Apply(set)
-	}
-	if err := set.Parse([]string{
-		"--postgres-host=" + dsn.Hostname(), "--postgres-port=" + dsn.Port(),
-		"--postgres-user=" + dsn.User.Username(), "--postgres-password=" + pass,
-		"--postgres-database=" + strings.TrimPrefix(dsn.Path, "/"),
+	c := testPGContext(t,
 		"--aws-access-key-id=k", "--aws-secret-access-key=s", "--aws-region=de",
-		"--aws-endpoint=" + s3hs.URL, "--aws-no-ssl",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	c := cli.NewContext(app, set, nil)
+		"--aws-endpoint="+s3hs.URL, "--aws-no-ssl",
+	)
 	w := &Worker{
 		pg:              cs.NewPG(c),
 		s3:              cs.NewS3Client(c, http.DefaultClient),
@@ -1041,7 +1049,7 @@ func TestDelete_StoreQueuedDuringDeletionWins(t *testing.T) {
 	e.s3.afterDelete = func(string) {
 		if !queued {
 			queued = true
-			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih"); err != nil {
+			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih", nil); err != nil {
 				t.Error(err)
 			}
 		}
@@ -1075,7 +1083,7 @@ func TestDelete_RowGoneMeanwhileIsDone(t *testing.T) {
 	e.s3.afterDelete = func(string) {
 		if !gone {
 			gone = true
-			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih"); err != nil {
+			if _, err := ResourceQueueForStoring(context.Background(), e.db, "ih", nil); err != nil {
 				t.Error(err)
 			}
 			if _, err := ResourceQueueForDeletion(context.Background(), e.db, "ih"); err != nil {

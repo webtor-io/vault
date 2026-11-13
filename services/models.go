@@ -63,7 +63,7 @@ type ErrorResponse struct {
 }
 
 // Resource represents a stored object composed from one or more files.
-// DB mapping is aligned with migrations/1_init.* and 8_resource_claim.*
+// DB mapping is aligned with migrations/1_init.*, 8_resource_claim.* and 9_resource_uids.*
 type Resource struct {
 	// go-pg table name
 	tableName struct{} `pg:"resource,discard_unknown_columns"`
@@ -83,6 +83,10 @@ type Resource struct {
 	// the old "row updated_at is stale" heuristic for cross-pod coordination.
 	ClaimExpiresAt *time.Time `json:"claim_expires_at,omitempty" pg:"claim_expires_at"`
 	ClaimedBy      *string    `json:"claimed_by,omitempty" pg:"claimed_by"`
+
+	// Pledgers' uids (migration 9) in the order the worker tries them.
+	// NULL: no pledgers.
+	UIDs []string `json:"uids,omitempty" pg:"uids,array"`
 
 	// Relations
 	// All resource<->file links for this resource. Use with Relation("ResourceFiles") or
@@ -196,7 +200,8 @@ func APILogWrite(ctx context.Context, db *pg.DB, resourceID string, operationTyp
 }
 
 // ResourceQueueForStoring inserts a new resource with queued status or updates existing to queued.
-func ResourceQueueForStoring(ctx context.Context, db *pg.DB, id string) (*Resource, error) {
+// A non-empty uids replaces the pledgers' uids whatever the status; an empty one leaves them.
+func ResourceQueueForStoring(ctx context.Context, db *pg.DB, id string, uids []string) (*Resource, error) {
 	res := &Resource{ID: id, Status: StatusQueuedForStoring}
 	err := db.Model(res).
 		Context(ctx).
@@ -206,17 +211,28 @@ func ResourceQueueForStoring(ctx context.Context, db *pg.DB, id string) (*Resour
 		return nil, err
 	}
 	if errors.Is(err, pg.ErrNoRows) {
+		if len(uids) > 0 {
+			res.UIDs = uids
+		}
 		if _, err = db.Model(res).Context(ctx).Insert(); err != nil {
 			return nil, err
 		}
 		return res, nil
 	}
 	if res.Status == StatusQueuedForStoring || res.Status == StatusStoring || res.Status == StatusStored {
-		return res, nil
+		if len(uids) == 0 {
+			return res, nil
+		}
+		return ResourceSetUIDs(ctx, db, id, uids)
 	}
 	res.Status = StatusQueuedForStoring
+	cols := []string{"status"}
+	if len(uids) > 0 {
+		res.UIDs = uids
+		cols = append(cols, "uids")
+	}
 	// update
-	if _, err = db.Model(res).Context(ctx).Column("status").WherePK().Update(); err != nil {
+	if _, err = db.Model(res).Context(ctx).Column(cols...).WherePK().Update(); err != nil {
 		return nil, err
 	}
 	// reload
@@ -224,6 +240,23 @@ func ResourceQueueForStoring(ctx context.Context, db *pg.DB, id string) (*Resour
 		return nil, err
 	}
 
+	return res, nil
+}
+
+// ResourceSetUIDs replaces the pledgers' uids of an existing resource and
+// leaves its status and lease alone. A missing resource gives nil, nil.
+func ResourceSetUIDs(ctx context.Context, db *pg.DB, id string, uids []string) (*Resource, error) {
+	if len(uids) == 0 {
+		uids = nil // NULL, not '{}': no pledgers
+	}
+	res := &Resource{ID: id, UIDs: uids}
+	_, err := db.Model(res).Context(ctx).Column("uids").WherePK().Returning("*").Update()
+	if errors.Is(err, pg.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
