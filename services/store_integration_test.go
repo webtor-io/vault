@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -169,15 +171,57 @@ type fakeTorrent struct {
 	// (open-ended) requests have end == -1.
 	mutate func(name string, start, end int64, data []byte)
 	// fail answers one GET of a file with 500 when it returns true.
-	fail  func(name string, start, end int64) bool
-	mu    sync.Mutex
-	opens []string // "name@start" of every open-ended (streaming) request
+	fail func(name string, start, end int64) bool
+	// gate answers list and export by the token's uid; status 0 lets the
+	// call through.
+	gate     func(uid string) (status int, body string)
+	mu       sync.Mutex
+	opens    []string // "name@start" of every open-ended (streaming) request
+	apiCalls []string // "list <role>/<uid>", "export <role>/<uid>" as they came
+}
+
+// gated records a rest-api call and answers it when gate refuses it.
+func (ft *fakeTorrent) gated(w http.ResponseWriter, r *http.Request, op string) bool {
+	uid := r.Header.Get("X-Test-Uid")
+	ft.mu.Lock()
+	ft.apiCalls = append(ft.apiCalls, op+" "+r.Header.Get("X-Test-Role")+"/"+uid)
+	ft.mu.Unlock()
+	if ft.gate == nil {
+		return false
+	}
+	status, body := ft.gate(uid)
+	if status == 0 {
+		return false
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+	return true
+}
+
+// refuseExcept refuses every uid but these with rest-api's private_torrent.
+func refuseExcept(uids ...string) func(string) (int, string) {
+	return func(uid string) (int, string) {
+		if slices.Contains(uids, uid) {
+			return 0, ""
+		}
+		return http.StatusForbidden, privateRefusal
+	}
+}
+
+func setUIDs(e *storeEnv, uids ...string) {
+	e.t.Helper()
+	if _, err := e.db.Exec(`UPDATE resource SET uids = ? WHERE resource_id = 'ih'`, pg.Array(uids)); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (ft *fakeTorrent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	switch {
 	case p[0] == "resource" && len(p) == 3 && p[2] == "list":
+		if ft.gated(w, r, "list") {
+			return
+		}
 		var items []map[string]any
 		for _, f := range ft.files {
 			path := "/t/" + f.name
@@ -188,6 +232,9 @@ func (ft *fakeTorrent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
 	case p[0] == "resource" && len(p) == 4 && p[2] == "export":
+		if ft.gated(w, r, "export") {
+			return
+		}
 		u := "http://" + r.Host + "/" + ft.infohash + "/" + p[3] + "?token=t"
 		_ = json.NewEncoder(w).Encode(map[string]any{"exports": map[string]any{"download": map[string]any{"url": u}}})
 	case len(p) == 2 && p[1] == "source.torrent":
@@ -280,10 +327,16 @@ func newStoreEnv(t *testing.T, info *metainfo.Info, files []testFile) *storeEnv 
 		"--aws-access-key-id=k", "--aws-secret-access-key=s", "--aws-region=de",
 		"--aws-endpoint="+s3hs.URL, "--aws-no-ssl",
 	)
+	// The fake reads the claims off headers instead of a signed token.
+	prepare := func(r *http.Request, cl *Claims) (*http.Request, error) {
+		r.Header.Set("X-Test-Role", cl.Role)
+		r.Header.Set("X-Test-Uid", cl.Uid)
+		return r, nil
+	}
 	w := &Worker{
 		pg:              cs.NewPG(c),
 		s3:              cs.NewS3Client(c, http.DefaultClient),
-		api:             &Api{url: apihs.URL, cl: http.DefaultClient, prepareRequest: func(r *http.Request, _ *Claims) (*http.Request, error) { return r, nil }},
+		api:             &Api{url: apihs.URL, cl: http.DefaultClient, prepareRequest: prepare},
 		bucket:          "vault",
 		part:            5 * mib,
 		concur:          4,
@@ -1101,5 +1154,164 @@ func TestDelete_RowGoneMeanwhileIsDone(t *testing.T) {
 		if e.s3.object(contentKey(f.bytes)) != nil {
 			t.Errorf("%s: object left in S3 after the deletion", f.name)
 		}
+	}
+}
+
+// ---- private torrents: the pledgers' uids ----
+
+// A pledger without a tracker record is skipped; the run is signed with the
+// first one that lists.
+func TestStore_PrivateTriesNextUid(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	setUIDs(e, uid0, uid1, uid2)
+	e.src.gate = refuseExcept(uid1)
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+	calls := e.src.apiCalls
+	if calls[0] != "list vault/"+uid0 || calls[1] != "list vault/"+uid1 {
+		t.Fatalf("calls %v: want uid0 refused, then uid1", calls)
+	}
+	for _, c := range calls[1:] {
+		if !strings.HasSuffix(c, "vault/"+uid1) {
+			t.Fatalf("call %q: the whole run must use uid1", c)
+		}
+	}
+}
+
+func TestStore_PrivateNoPledgerRecord(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	setUIDs(e, uid0, uid1)
+	e.src.gate = refuseExcept()
+	err := e.store()
+	if err != ErrNoPledgerRecord || err.Error() != "private: no pledger has a tracker record" {
+		t.Fatalf("store: %v, want ErrNoPledgerRecord as is", err)
+	}
+	if want := []string{"list vault/" + uid0, "list vault/" + uid1}; !slices.Equal(e.src.apiCalls, want) {
+		t.Fatalf("calls %v, want %v", e.src.apiCalls, want)
+	}
+}
+
+// No uids: one attempt without a uid, refused like any other.
+func TestStore_PrivateNoUidsTriesWithoutUid(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.src.gate = refuseExcept()
+	if err := e.store(); err != ErrNoPledgerRecord {
+		t.Fatalf("store: %v, want ErrNoPledgerRecord", err)
+	}
+	if want := []string{"list vault/"}; !slices.Equal(e.src.apiCalls, want) {
+		t.Fatalf("calls %v, want %v", e.src.apiCalls, want)
+	}
+}
+
+// A public resource (no uids) is stored as before: one listing, no uid.
+func TestStore_NoUidsSignsWithoutUid(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	if err := e.store(); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	e.assertStored(files)
+	lists := 0
+	for _, c := range e.src.apiCalls {
+		if !strings.HasSuffix(c, "vault/") {
+			t.Fatalf("call %q: want no uid", c)
+		}
+		if strings.HasPrefix(c, "list ") {
+			lists++
+		}
+	}
+	if lists != 1 {
+		t.Fatalf("calls %v: want exactly one listing", e.src.apiCalls)
+	}
+}
+
+// Only private_torrent moves on to the next pledger: an outage or another
+// refusal must not burn every pledger and record a false reason.
+func TestStore_UidFallbackOnlyOnPrivateTorrent(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{http.StatusServiceUnavailable, `{"error":"x","code":"store_outdated"}`},
+		{http.StatusForbidden, `{"error":"x","code":"private_unavailable"}`},
+		{http.StatusForbidden, `{"error":"forbidden"}`},
+	} {
+		t.Run(fmt.Sprintf("%d %s", tc.status, tc.body), func(t *testing.T) {
+			files := twoFiles()
+			info, _, _ := buildTestTorrent(t, mib, files)
+			e := newStoreEnv(t, info, files)
+			setUIDs(e, uid0, uid1)
+			e.src.gate = func(uid string) (int, string) {
+				if uid == uid0 {
+					return tc.status, tc.body
+				}
+				return 0, ""
+			}
+			err := e.store()
+			if err == nil || errors.Is(err, ErrNoPledgerRecord) {
+				t.Fatalf("store: %v, want the failure itself", err)
+			}
+			for _, c := range e.src.apiCalls {
+				if strings.Contains(c, uid1) {
+					t.Fatalf("calls %v: uid1 tried after a failure that is not private_torrent", e.src.apiCalls)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyExisting_SignsWithPledgerUid(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	setUIDs(e, uid0, uid1)
+	e.src.gate = refuseExcept(uid1)
+	if stats := e.verifyExisting(true); stats.Errors != 0 || stats.Clean != 1 {
+		t.Fatalf("stats %+v: want clean", stats)
+	}
+	calls := e.src.apiCalls
+	if len(calls) < 2 || calls[0] != "list vault/"+uid0 || calls[1] != "list vault/"+uid1 {
+		t.Fatalf("calls %v: want uid0 refused, then uid1", calls)
+	}
+	exports := 0
+	for _, c := range calls {
+		if strings.HasPrefix(c, "export ") {
+			exports++
+			if c != "export vault/"+uid1 {
+				t.Fatalf("call %q: exports must use uid1", c)
+			}
+		}
+	}
+	if exports == 0 {
+		t.Fatalf("calls %v: no export", calls)
+	}
+}
+
+// No pledger lists: the resource is skipped, nothing invalidated.
+func TestVerifyExisting_NoPledgerRecordSkipsResource(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	e.seedStored(files, nil)
+	setUIDs(e, uid0)
+	e.src.gate = refuseExcept()
+	if stats := e.verifyExisting(true); stats.Errors != 1 {
+		t.Fatalf("stats %+v: want one error", stats)
+	}
+	if len(e.fileRows()) != 2 {
+		t.Fatal("files were removed")
+	}
+	if r, err := ResourceGetByID(context.Background(), e.db, "ih"); err != nil || r.Status != StatusStored {
+		t.Fatalf("resource %+v (%v), want it left stored", r, err)
 	}
 }
