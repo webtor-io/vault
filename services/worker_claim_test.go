@@ -201,3 +201,18 @@ func TestTryClaimInterruptedBeforeRetries(t *testing.T) {
 		t.Errorf("first claim = %+v (%v), want the interrupted job", res, err)
 	}
 }
+
+// A rolled-back image keeps claiming after a newer migration added a column.
+func TestTryClaimToleratesUnknownColumns(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.Exec(`ALTER TABLE resource ADD COLUMN later_column text`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO resource (resource_id, status, later_column) VALUES ('q', 0, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := (&Worker{}).tryClaim(context.Background(), db, "pod-a#0", false)
+	if err != nil || res == nil || res.ID != "q" {
+		t.Fatalf("claim = %+v (%v), want q despite an unknown column", res, err)
+	}
+}

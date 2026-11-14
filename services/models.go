@@ -66,7 +66,7 @@ type ErrorResponse struct {
 // DB mapping is aligned with migrations/1_init.* and 8_resource_claim.*
 type Resource struct {
 	// go-pg table name
-	tableName struct{} `pg:"resource"`
+	tableName struct{} `pg:"resource,discard_unknown_columns"`
 
 	ID         string    `json:"resource_id" pg:"resource_id,pk"`
 	Status     Status    `json:"status" pg:"status,use_zero"`
