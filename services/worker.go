@@ -564,35 +564,32 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// 3) `handleDelete` runs a post-deletion orphan sweep to catch any
 	//    `file` rows left behind by cancelled store attempts.
 
-	cla := &Claims{
-		Role: "vault",
+	row, err := ResourceGetByID(ctx, db, id)
+	if err != nil {
+		return errors.Wrap(err, "failed to load resource")
+	}
+	if row == nil {
+		return errors.New("resource not found")
 	}
 
 	// Phase 1: prefetch the full listing and compute final total_size up
 	// front. This way the UI's stored/total ratio rises monotonically
 	// instead of bouncing 100% → 99% → 100% on every page boundary as
 	// each newly discovered file inflates the denominator.
-	listArgs := &ListResourceContentArgs{
-		Limit:  100,
-		Offset: 0,
+	//
+	// A private torrent lists only for a pledger with a tracker record; the
+	// uid that lists signs the whole run. A later 403 fails the run, and
+	// the next one starts over from the first uid.
+	cla, fileItems, err := listAsPledger(ctx, s.api, id, row.UIDs)
+	if errors.Is(err, ErrNoPledgerRecord) {
+		return err // resource.error is the spec's text
 	}
-	var fileItems []ra.ListItem
+	if err != nil {
+		return errors.Wrap(err, "failed to list resource content")
+	}
 	var totalSize int64
-	for {
-		resp, err := s.api.ListResourceContent(ctx, cla, id, listArgs)
-		if err != nil {
-			return errors.Wrap(err, "failed to list resource content")
-		}
-		for _, item := range resp.Items {
-			if item.Type == ra.ListTypeFile {
-				fileItems = append(fileItems, item)
-				totalSize += item.Size
-			}
-		}
-		if len(resp.Items) < int(listArgs.Limit) {
-			break
-		}
-		listArgs.Offset += listArgs.Limit
+	for _, item := range fileItems {
+		totalSize += item.Size
 	}
 
 	// Reset resource counters before (re)storing. total_size is now known

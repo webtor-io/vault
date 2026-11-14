@@ -28,6 +28,13 @@ definitions:
         type: integer
       total_size:
         type: integer
+      uids:
+        description: |-
+          Pledgers' uids (migration 9) in the order the worker tries them.
+          NULL: no pledgers.
+        items:
+          type: string
+        type: array
       updated_at:
         type: string
     type: object
@@ -50,6 +57,13 @@ definitions:
     - StatusQueuedForDeletion
     - StatusDeleting
     - StatusDeleteError
+  services.UIDsRequest:
+    properties:
+      uids:
+        items:
+          type: string
+        type: array
+    type: object
 info:
   contact:
     email: support@webtor.io
@@ -103,23 +117,75 @@ paths:
       tags:
       - resource
     put:
-      description: Creates the resource if missing or marks it queued for processing
+      consumes:
+      - application/json
+      description: Creates the resource if missing or marks it queued for processing.
+        A non-empty uids replaces the pledgers' uids; no body or an empty list leaves
+        them
       parameters:
       - description: Resource ID
         in: path
         name: id
         required: true
         type: string
+      - description: Pledgers' uids
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/services.UIDsRequest'
       responses:
         "202":
           description: Accepted
           schema:
             $ref: '#/definitions/services.Resource'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/services.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
             $ref: '#/definitions/services.ErrorResponse'
       summary: Queue storing of a resource
+      tags:
+      - resource
+  /resource/{id}/uids:
+    put:
+      consumes:
+      - application/json
+      description: Replaces the uids the worker signs with, keeping their order. The
+        status is not changed and a missing resource is not created. {}, null and
+        [] clear the list
+      parameters:
+      - description: Resource ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Pledgers' uids
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/services.UIDsRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/services.Resource'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/services.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/services.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/services.ErrorResponse'
+      summary: Replace the pledgers' uids of a resource
       tags:
       - resource
   /webseed/{id}/{path}:

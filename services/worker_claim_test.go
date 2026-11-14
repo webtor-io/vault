@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -214,5 +215,27 @@ func TestTryClaimToleratesUnknownColumns(t *testing.T) {
 	res, err := (&Worker{}).tryClaim(context.Background(), db, "pod-a#0", false)
 	if err != nil || res == nil || res.ID != "q" {
 		t.Fatalf("claim = %+v (%v), want q despite an unknown column", res, err)
+	}
+}
+
+// No pledger lists: store_error with the spec's text, not wrapped.
+func TestProcessClaimedNoPledgerRecord(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.Exec(`INSERT INTO resource (resource_id, status, claimed_by, claim_expires_at, uids) VALUES ('r', 1, 'pod-a#0', now() + interval '2 minutes', ARRAY[?, ?])`, uid0, uid1); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(privateRefusal))
+	}))
+	defer srv.Close()
+	w := &Worker{api: &Api{url: srv.URL, cl: srv.Client(), prepareRequest: func(r *http.Request, _ *Claims) (*http.Request, error) { return r, nil }}}
+	w.processClaimed(context.Background(), db, &Resource{ID: "r", Status: StatusStoring}, "pod-a#0")
+	var res Resource
+	if err := db.Model(&res).Where("resource_id = 'r'").Select(); err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != StatusStoreError || res.Error == nil || *res.Error != "private: no pledger has a tracker record" {
+		t.Fatalf("got status=%s error=%v, want store_error with the spec text", res.Status, res.Error)
 	}
 }

@@ -49,9 +49,9 @@ The `serve` command initializes all components in order: PG connection → migra
 
 ## Database
 
-PostgreSQL with auto-migrations via `go-pg/migrations`. Migration files in `migrations/` (5 migrations).
+PostgreSQL with auto-migrations via `go-pg/migrations`. Migration files in `migrations/` (9 migrations).
 
-Core tables: `resource` (status, sizes, timestamps), `file` (hash-based PK, dedup), `resource_file` (junction with path), `log` (operation audit trail).
+Core tables: `resource` (status, sizes, timestamps, pledgers' `uids`), `file` (hash-based PK, dedup), `resource_file` (junction with path), `log` (operation audit trail).
 
 ## Configuration
 
