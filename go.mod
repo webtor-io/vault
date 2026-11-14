@@ -141,4 +141,4 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/anacrolix/torrent => github.com/webtor-io/torrent v0.0.0-20261109065425-4886a4fd6e64
+replace github.com/anacrolix/torrent => github.com/webtor-io/torrent v0.0.0-20261114101238-3a021a7c7023

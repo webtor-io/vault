@@ -1398,8 +1398,8 @@ github.com/webtor-io/magnet2torrent v0.0.0-20220312143110-bc1a7e4bcbba h1:OyPsU+
 github.com/webtor-io/magnet2torrent v0.0.0-20220312143110-bc1a7e4bcbba/go.mod h1:2cBSuVh1bLCrVUUy5TxEZj+Msuzz127kEt5XfeX/F3s=
 github.com/webtor-io/rest-api v1.0.1-0.20261002212552-898a58691546 h1:0Z7j6x8W83ry3O5C2XDyPHmAFWvRHVgDOZG9z5IjIuw=
 github.com/webtor-io/rest-api v1.0.1-0.20261002212552-898a58691546/go.mod h1:kN23b+LiP0muoouo6En4l64kCPlrumgXPgHNe67y2sM=
-github.com/webtor-io/torrent v0.0.0-20261109065425-4886a4fd6e64 h1:tVXQYt9LE2OD2iKxdTnB7Ar3ypqtOukDeFh1futXATM=
-github.com/webtor-io/torrent v0.0.0-20261109065425-4886a4fd6e64/go.mod h1:+grExvB/R/rMshKJNTTPNxKFLsxqbETsXsyQDHSQfUA=
+github.com/webtor-io/torrent v0.0.0-20261114101238-3a021a7c7023 h1:sYvP+Lp4TWIFs+jZn7yxWYWI/Ql30baGzC8W2Kiup3Q=
+github.com/webtor-io/torrent v0.0.0-20261114101238-3a021a7c7023/go.mod h1:+grExvB/R/rMshKJNTTPNxKFLsxqbETsXsyQDHSQfUA=
 github.com/webtor-io/torrent-store v1.0.1-0.20260614135143-50f5d91eee6b h1:jmEAhWEzU9RDKsOh2r7qdRvwOm8ZkTDe/9WnbaxIHb8=
 github.com/webtor-io/torrent-store v1.0.1-0.20260614135143-50f5d91eee6b/go.mod h1:HEre6qOE71TekOuef3PQD1C0fvh6pOdRVOeOadtOnek=
 github.com/willf/bitset v1.1.9/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
