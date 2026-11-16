@@ -165,11 +165,15 @@ func TestSweep_StillRemovesTrueOrphans(t *testing.T) {
 	}
 }
 
-// The orphan metric counts what the sweeps would remove, not resumable uploads.
+// The orphan metric counts what the sweeps would remove, not resumable uploads
+// or linked files.
 func TestOrphanMetricExcludesResumable(t *testing.T) {
 	db := testDB(t)
 	if _, err := db.Exec(`INSERT INTO file (hash, status, upload_id, total_size) VALUES
-		('resumable', ?, 'u1', 10), ('orphan', ?, NULL, 1)`, StatusStoring, StatusStored); err != nil {
+		('resumable', ?0, 'u1', 10), ('orphan', ?1, NULL, 1), ('linked', ?1, NULL, 100);
+		INSERT INTO resource (resource_id, status) VALUES ('r', ?2);
+		INSERT INTO resource_file (resource_id, file_hash, path) VALUES ('r', 'linked', '/t/x')`,
+		StatusStoring, StatusStored, StatusStored); err != nil {
 		t.Fatal(err)
 	}
 	got, err := orphanFiles(context.Background(), db)

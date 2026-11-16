@@ -816,9 +816,9 @@ func (s *Worker) gcFileIfUnreferenced(ctx context.Context, db *pg.DB, hash strin
 	}
 	s3Cl := s.s3.Get()
 	// Abort any in-flight multipart upload so we don't leave parts
-	// accruing quota. Best-effort: the row goes next, so no sweep retries a
-	// failed abort; only a bucket lifecycle rule would (assumed 7 days, not
-	// verified on the bucket).
+	// accruing quota. Best-effort: the row normally goes next, so nothing
+	// but a bucket lifecycle rule (assumed 7 days, not verified on the
+	// bucket) retries a failed abort.
 	if f.UploadID != "" {
 		if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
 			Bucket:   aws.String(s.bucket),
@@ -974,9 +974,9 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 		}
 		// If the file was still in-flight (multipart upload not yet
 		// completed), abort the upload so its parts don't accumulate
-		// S3 quota. Best-effort: the row goes next, so no sweep retries a
-		// failed abort; only a bucket lifecycle rule would (assumed 7 days,
-		// not verified on the bucket).
+		// S3 quota. Best-effort: the row normally goes next, so nothing
+		// but a bucket lifecycle rule (assumed 7 days, not verified on the
+		// bucket) retries a failed abort.
 		s3Cl := s.s3.Get()
 		if f.UploadID != "" {
 			if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
