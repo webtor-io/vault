@@ -74,7 +74,9 @@ func GCOptionsFromContext(c *cli.Context) GCOptions {
 
 // RunGC scans for File rows that have no referencing ResourceFile row
 // and are older than opts.Grace, then removes them from S3 (aborting
-// any in-flight multipart upload first) and from the database. It is
+// any in-flight multipart upload first) and from the database. A row
+// holding a resumable upload is kept for its retry until
+// resumableUploadWindow passes (see notResumable). It is
 // safe to run concurrently with the worker: the grace window keeps it
 // away from rows the worker is actively touching, and we re-check the
 // reference count right before deletion.
@@ -90,6 +92,7 @@ func RunGC(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, bucket string, op
 		return stats, errors.New("s3 bucket is not configured")
 	}
 	cutoff := time.Now().Add(-opts.Grace)
+	cond, params := notResumable()
 
 	var orphans []File
 	// LEFT JOIN + IS NULL gives files with no matching resource_file row.
@@ -100,6 +103,7 @@ func RunGC(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, bucket string, op
 		Join(`LEFT JOIN resource_file AS rf ON rf.file_hash = "file".hash`).
 		Where(`rf.resource_id IS NULL`).
 		Where(`"file".updated_at < ?`, cutoff).
+		Where(cond, params...).
 		OrderExpr(`"file".updated_at ASC`).
 		Limit(opts.Limit).
 		Select()

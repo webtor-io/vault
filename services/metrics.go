@@ -104,12 +104,12 @@ func NewMetrics(c *cli.Context, pg *cs.PG) *Metrics {
 		orphanCount: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_files_total",
-			Help:      "File rows with no resource_file reference — candidates for the gc sweep.",
+			Help:      "File rows with no resource_file reference, except storing rows whose multipart upload is in flight or kept for the retry (touched in the last 7 days) — what the orphan sweeps remove once past their cutoffs.",
 		}),
 		orphanBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_bytes_total",
-			Help:      "Sum of total_size for orphan file rows.",
+			Help:      "Sum of total_size for orphan file rows (see orphan_files_total).",
 		}),
 		multipartInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -207,6 +207,29 @@ type statusAggregate struct {
 	StoredBytes int64 `pg:"stored_bytes"`
 }
 
+type orphanAggregate struct {
+	Count int64 `pg:"count"`
+	Bytes int64 `pg:"bytes"`
+}
+
+// orphanFiles counts the file rows with no resource_file reference that hold
+// no resumable upload, whatever their age: what the orphan sweeps remove once
+// past their cutoffs.
+func orphanFiles(ctx context.Context, db *pg.DB) (orphanAggregate, error) {
+	var orphan orphanAggregate
+	cond, params := notResumable()
+	if _, err := db.QueryOneContext(ctx, &orphan, `
+		SELECT count(*)                                    AS count,
+		       COALESCE(sum("file".total_size), 0)::bigint AS bytes
+		FROM file
+		WHERE NOT EXISTS (
+			SELECT 1 FROM resource_file rf WHERE rf.file_hash = "file".hash
+		) AND `+cond, params...); err != nil {
+		return orphan, errors.Wrap(err, "orphan aggregate query failed")
+	}
+	return orphan, nil
+}
+
 func (m *Metrics) doRefresh(ctx context.Context) error {
 	db := m.pg.Get()
 	if db == nil {
@@ -257,20 +280,9 @@ func (m *Metrics) doRefresh(ctx context.Context) error {
 		m.fileStored.WithLabelValues(label).Set(float64(s.StoredBytes))
 	}
 
-	// Orphan files (no resource_file).
-	var orphan struct {
-		Count int64 `pg:"count"`
-		Bytes int64 `pg:"bytes"`
-	}
-	if _, err := db.QueryOneContext(ctx, &orphan, `
-		SELECT count(*)                               AS count,
-		       COALESCE(sum(f.total_size), 0)::bigint AS bytes
-		FROM file f
-		WHERE NOT EXISTS (
-			SELECT 1 FROM resource_file rf WHERE rf.file_hash = f.hash
-		)
-	`); err != nil {
-		return errors.Wrap(err, "orphan aggregate query failed")
+	orphan, err := orphanFiles(ctx, db)
+	if err != nil {
+		return err
 	}
 	m.orphanCount.Set(float64(orphan.Count))
 	m.orphanBytes.Set(float64(orphan.Bytes))
