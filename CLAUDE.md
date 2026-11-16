@@ -19,7 +19,7 @@ make build
 swag init -g services/web.go --instanceName vault
 ```
 
-Tests: `go test ./...`. The claim and shutdown tests need a throwaway Postgres in `VAULT_TEST_PG_DSN` and skip without it (see `services/worker_claim_test.go`).
+Tests: `go test ./...`. The claim, shutdown, store and orphan-sweep tests need a throwaway Postgres in `VAULT_TEST_PG_DSN` and skip without it (see `services/worker_claim_test.go`).
 
 ## Architecture
 
@@ -46,6 +46,8 @@ The `serve` command initializes all components in order: PG connection → migra
 - A job cut short by shutdown is **not** a failure: it stays `storing`, `Close` clears the lease (keeping `claimed_by` as the last holder) and another pod resumes it at once
 - Resource status lifecycle: `queued_for_storing` → `storing` → `stored` (or `store_error`), `queued_for_deletion` → `deleting` → (deleted or `delete_error`)
 - Error wrapping with `pkg/errors` throughout worker code
+
+**Orphans and resumable uploads.** A `file` row is linked to its resource (`resource_file`) only when its upload completes, so a store that failed or was cut short leaves its row unlinked, `storing`, with the `upload_id` its retry resumes from. Two sweeps remove unlinked rows and their S3 objects/uploads: `sweepOrphanFiles` after every `handleDelete` (rows idle over the 2-minute lease) and the `vault gc` CronJob (`--gc-grace-period`, 4 h in prod). Both skip a resumable upload — `storing`, non-empty `upload_id`, touched within `resumableUploadWindow` (7 days) — through one predicate, `notResumable`, which the `vault_orphan_*` metrics share. Before, they aborted it and the retry re-uploaded from byte 0 (2026-11-16: 57 files, ~645 GB in 12 h). The 7 days match the pledge's contract window (web-ui reaps an unfinished pledge 7 days after funding). The cost: a resource deleted mid-upload leaves its partial upload in S3 for 7 days after the row's last activity, until the next sweep or the daily gc run aborts it, whether or not the bucket has a lifecycle rule. A completed but unlinked object (a crash or lease loss between `CompleteMultipartUpload` and the link transaction, or a short object) still has its `upload_id` and is kept the same way, at full size. Stored-but-unlinked rows, `storing` rows without an upload, `deleting` rows and uploads idle past the window are swept as before.
 
 ## Database
 

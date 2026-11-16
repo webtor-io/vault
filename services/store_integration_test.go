@@ -674,29 +674,7 @@ func TestStore_DedupCandidateMissingInS3(t *testing.T) {
 // A source hiccup while completing a boundary piece fails the attempt but keeps
 // the uploaded parts; the retry resumes instead of starting over.
 func TestStore_SourceErrorKeepsParts(t *testing.T) {
-	files := twoFiles()
-	info, _, _ := buildTestTorrent(t, mib, files)
-	e := newStoreEnv(t, info, files)
-	failures := 3 // readRange's attempts
-	e.src.fail = func(name string, start, end int64) bool {
-		if name == "b" && end >= 0 && start == 0 && failures > 0 { // a's tail piece reads b's head
-			failures--
-			return true
-		}
-		return false
-	}
-	if err := e.store(); err == nil {
-		t.Fatal("want the first attempt to fail on the source read")
-	}
-	e.s3.mu.Lock()
-	kept := 0
-	for _, parts := range e.s3.uploads {
-		kept += len(parts)
-	}
-	e.s3.mu.Unlock()
-	if kept == 0 {
-		t.Fatal("the failed attempt aborted its multipart upload")
-	}
+	e, files := failedStore(t)
 	if err := e.store(); err != nil {
 		t.Fatalf("retry: %v", err)
 	}

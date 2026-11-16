@@ -38,6 +38,23 @@ const (
 	storeErrorBackoff = 30 * time.Minute
 )
 
+// resumableUploadWindow is how long a store that failed or was cut short keeps
+// its multipart upload for the retry. It matches the pledge's contract window:
+// web-ui reaps an unfinished pledge 7 days after funding.
+const resumableUploadWindow = 7 * 24 * time.Hour
+
+// notResumable is the condition, on a "file" row, that it holds no resumable
+// upload. A file is linked to its resource only once its upload completes, so
+// until then a failed store leaves its row unlinked, storing, with the
+// upload_id the retry resumes from. The orphan sweeps (sweepOrphanFiles,
+// RunGC) and the orphan metric skip such a row until resumableUploadWindow
+// passes without activity. upload_id is NULL on a row inserted before its
+// upload was created.
+func notResumable() (string, []interface{}) {
+	return `NOT ("file".status = ? AND COALESCE("file".upload_id, '') <> '' AND "file".updated_at > now() - make_interval(secs => ?))`,
+		[]interface{}{StatusStoring, resumableUploadWindow.Seconds()}
+}
+
 // Worker processes background store and delete jobs for vault resources.
 // Each worker goroutine runs an independent claim loop that acquires a
 // lease on exactly one resource at a time via an atomic UPDATE ...
@@ -562,7 +579,9 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	//    queued_for_deletion — `resource_file` reflects a valid superset
 	//    of the files that are currently in S3.
 	// 3) `handleDelete` runs a post-deletion orphan sweep to catch any
-	//    `file` rows left behind by cancelled store attempts.
+	//    `file` rows left behind by cancelled store attempts. A row still
+	//    holding its multipart upload waits there up to
+	//    resumableUploadWindow, so the retry resumes it (see notResumable).
 
 	row, err := ResourceGetByID(ctx, db, id)
 	if err != nil {
@@ -797,8 +816,9 @@ func (s *Worker) gcFileIfUnreferenced(ctx context.Context, db *pg.DB, hash strin
 	}
 	s3Cl := s.s3.Get()
 	// Abort any in-flight multipart upload so we don't leave parts
-	// accruing quota. Best-effort: the 7-day S3 lifecycle rule is the
-	// ultimate backstop.
+	// accruing quota. Best-effort: the row normally goes next, so nothing
+	// but a bucket lifecycle rule (assumed 7 days, not verified on the
+	// bucket) retries a failed abort.
 	if f.UploadID != "" {
 		if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
 			Bucket:   aws.String(s.bucket),
@@ -829,11 +849,14 @@ func (s *Worker) gcFileIfUnreferenced(ctx context.Context, db *pg.DB, hash strin
 // sweepOrphanFiles finds `file` rows with no `resource_file` reference
 // whose updated_at is older than leaseDuration (meaning the creating
 // worker has certainly abandoned them) and removes them from S3 and the
-// database. Called from handleDelete as a post-deletion safety net.
+// database. A row holding a resumable upload is kept for its retry until
+// resumableUploadWindow passes (see notResumable). Called from handleDelete
+// as a post-deletion safety net.
 // Returns the number of files removed. Only a query-level failure is
 // returned; per-file errors are logged and skipped.
 func (s *Worker) sweepOrphanFiles(ctx context.Context, db *pg.DB) (int, error) {
 	cutoff := time.Now().Add(-leaseDuration)
+	cond, params := notResumable()
 	var orphans []File
 	err := db.Model(&orphans).
 		Context(ctx).
@@ -841,6 +864,7 @@ func (s *Worker) sweepOrphanFiles(ctx context.Context, db *pg.DB) (int, error) {
 		Join(`LEFT JOIN resource_file AS rf ON rf.file_hash = "file".hash`).
 		Where(`rf.resource_id IS NULL`).
 		Where(`"file".updated_at < ?`, cutoff).
+		Where(cond, params...).
 		OrderExpr(`"file".updated_at ASC`).
 		Limit(100).
 		Select()
@@ -950,8 +974,9 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 		}
 		// If the file was still in-flight (multipart upload not yet
 		// completed), abort the upload so its parts don't accumulate
-		// S3 quota. Best-effort: a 7-day bucket lifecycle rule is the
-		// ultimate backstop, but aborting here keeps cleanup prompt.
+		// S3 quota. Best-effort: the row normally goes next, so nothing
+		// but a bucket lifecycle rule (assumed 7 days, not verified on the
+		// bucket) retries a failed abort.
 		s3Cl := s.s3.Get()
 		if f.UploadID != "" {
 			if _, err := s3Cl.AbortMultipartUploadWithContext(ctx, &awss3.AbortMultipartUploadInput{
@@ -1007,6 +1032,8 @@ func (s *Worker) handleDelete(ctx context.Context, db *pg.DB, id string) (err er
 	// resource_file references. These can appear when a store attempt
 	// was cancelled (lease loss, incoming deletion) after uploading to
 	// S3 but before the atomic transaction that links file → resource.
+	// A row still holding a resumable upload, the deleted resource's
+	// included, waits out resumableUploadWindow first (see notResumable).
 	if swept, swErr := s.sweepOrphanFiles(ctx, db); swErr != nil {
 		log.WithError(swErr).Warn("post-delete orphan sweep failed")
 	} else if swept > 0 {
