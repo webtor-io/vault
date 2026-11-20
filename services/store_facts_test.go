@@ -30,15 +30,7 @@ func noTorrent(e *storeEnv) {
 
 func links(e *storeEnv) map[string]string {
 	e.t.Helper()
-	var rfs []ResourceFile
-	if err := e.db.Model(&rfs).Where("resource_id = 'ih'").Select(); err != nil {
-		e.t.Fatal(err)
-	}
-	out := map[string]string{}
-	for _, rf := range rfs {
-		out[rf.Path] = rf.FileHash
-	}
-	return out
+	return linksOf(e, "ih")
 }
 
 func status(e *storeEnv) Status {

@@ -110,8 +110,8 @@ func TestVerifyExisting_SkipsUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify-existing: %v", err)
 	}
-	if stats.Resources != 1 || stats.Errors != 0 {
-		t.Errorf("stats %+v, want 1 resource and 0 errors", stats)
+	if stats.Resources != 1 || stats.Skipped != 1 || stats.Clean != 0 || stats.Errors != 0 {
+		t.Errorf("stats %+v, want 1 resource, skipped, neither clean nor an error", stats)
 	}
 	if len(e.src.apiCalls) != 0 {
 		t.Errorf("rest-api called: %v", e.src.apiCalls)

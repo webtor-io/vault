@@ -637,7 +637,7 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// embedded in the first file's export URL to avoid resigning JWTs.
 	var mi *metainfo.Info
 	// An upload has no .torrent to verify against.
-	if s.verifyIntegrity && len(fileItems) > 0 && !uploads.HomeHosted(id) {
+	if s.verifyIntegrity && !uploads.HomeHosted(id) {
 		ei, err := s.api.ExportResourceContent(ctx, cla, id, fileItems[0].ID)
 		if err != nil {
 			return errors.Wrap(err, "failed to export resource content for torrent fetch")

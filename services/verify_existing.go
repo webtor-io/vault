@@ -97,6 +97,9 @@ type VerifyExistingStats struct {
 	// BoundaryPieces checked, and mismatches the source could not attribute.
 	BoundaryPieces int
 	Unresolved     int
+	// Skipped had nothing to verify against (an upload, a torrent without
+	// v1 piece hashes): neither clean nor an error.
+	Skipped int
 }
 
 // RunVerifyExisting is the one-shot maintenance pass that recomputes
@@ -149,6 +152,7 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 		r := &resources[ri]
 		if uploads.HomeHosted(r.ID) {
 			log.WithField("id", r.ID).Info("verify-existing: upload has no .torrent, nothing to verify against")
+			stats.Skipped++
 			continue
 		}
 		stats.BytesScanned += r.TotalSize
@@ -166,6 +170,7 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 
 		if !mi.HasV1() {
 			log.WithField("id", r.ID).Info("verify-existing: torrent has no v1 piece hashes, nothing to verify against")
+			stats.Skipped++
 			continue
 		}
 
@@ -305,6 +310,7 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 		"requeued":      stats.Requeued,
 		"s3_deleted":    stats.S3Deleted,
 		"errors":        stats.Errors,
+		"skipped":       stats.Skipped,
 		"bytes_scanned": stats.BytesScanned,
 	}).Info("verify-existing: sweep complete")
 	return stats, nil
