@@ -174,25 +174,16 @@ func (s *Web) getResourceFiles(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	res, err := ResourceGetByID(ctx, db, c.Param("id"))
+	res, err := ResourceListStoredFiles(ctx, db, c.Param("id"))
 	if err != nil {
 		_ = c.Error(err)
 		return
 	}
-	if res == nil || res.Status != StatusStored {
+	if res == nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	files, err := ResourceListStoredFiles(ctx, db, res.ID)
-	if err != nil {
-		_ = c.Error(err)
-		return
-	}
-	uids := res.UIDs
-	if uids == nil {
-		uids = []string{}
-	}
-	c.JSON(http.StatusOK, ResourceFilesResponse{UIDs: uids, Files: files})
+	c.JSON(http.StatusOK, res)
 }
 
 // DELETE /resource/{id} — queue deletion

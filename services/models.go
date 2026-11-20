@@ -280,20 +280,39 @@ type ResourceFileListing struct {
 	Size int64  `json:"size"`
 }
 
-// ResourceListStoredFiles lists the resource's files whose bytes are stored,
-// one per path in path order. Where a path is listed twice, the row with the
-// lowest file hash wins.
-func ResourceListStoredFiles(ctx context.Context, db *pg.DB, id string) ([]ResourceFileListing, error) {
-	files := []ResourceFileListing{}
-	_, err := db.QueryContext(ctx, &files, `
-		SELECT DISTINCT ON (rf.path) rf.path, f.total_size AS size
-		FROM resource_file rf JOIN file f ON f.hash = rf.file_hash
-		WHERE rf.resource_id = ? AND f.status = ?
-		ORDER BY rf.path, rf.file_hash`, id, StatusStored)
-	if err != nil {
+// ResourceListStoredFiles returns a stored resource's uids and its files
+// whose bytes are stored, one per path in path order; nil when the resource
+// is missing or not stored. Where a path is listed twice, the row with the
+// lowest file hash wins. The status and the files are read by one statement:
+// a deletion that starts meanwhile cannot cut the list short.
+func ResourceListStoredFiles(ctx context.Context, db *pg.DB, id string) (*ResourceFilesResponse, error) {
+	var rows []struct {
+		UIDs []string `pg:"uids,array"`
+		Path *string  // NULL: the resource has no stored file
+		Size int64
+	}
+	_, err := db.QueryContext(ctx, &rows, `
+		SELECT r.uids, l.path, l.size
+		FROM resource r LEFT JOIN LATERAL (
+			SELECT DISTINCT ON (rf.path) rf.path, f.total_size AS size
+			FROM resource_file rf JOIN file f ON f.hash = rf.file_hash
+			WHERE rf.resource_id = r.resource_id AND f.status = ?
+			ORDER BY rf.path, rf.file_hash) l ON true
+		WHERE r.resource_id = ? AND r.status = ?
+		ORDER BY l.path`, StatusStored, id, StatusStored)
+	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	return files, nil
+	res := &ResourceFilesResponse{UIDs: rows[0].UIDs, Files: []ResourceFileListing{}}
+	if res.UIDs == nil {
+		res.UIDs = []string{}
+	}
+	for _, r := range rows {
+		if r.Path != nil {
+			res.Files = append(res.Files, ResourceFileListing{Path: *r.Path, Size: r.Size})
+		}
+	}
+	return res, nil
 }
 
 // ResourceQueueForDeletion marks the resource as queued (placeholder for deletion workflow).
