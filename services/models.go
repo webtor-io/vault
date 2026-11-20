@@ -273,6 +273,29 @@ func ResourceGetByID(ctx context.Context, db *pg.DB, id string) (*Resource, erro
 	return res, nil
 }
 
+// ResourceFileListing is one stored file of a resource: its path as listed
+// (with a leading "/") and its size.
+type ResourceFileListing struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+// ResourceListStoredFiles lists the resource's files whose bytes are stored,
+// one per path in path order. Where a path is listed twice, the row with the
+// lowest file hash wins.
+func ResourceListStoredFiles(ctx context.Context, db *pg.DB, id string) ([]ResourceFileListing, error) {
+	files := []ResourceFileListing{}
+	_, err := db.QueryContext(ctx, &files, `
+		SELECT DISTINCT ON (rf.path) rf.path, f.total_size AS size
+		FROM resource_file rf JOIN file f ON f.hash = rf.file_hash
+		WHERE rf.resource_id = ? AND f.status = ?
+		ORDER BY rf.path, rf.file_hash`, id, StatusStored)
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
 // ResourceQueueForDeletion marks the resource as queued (placeholder for deletion workflow).
 func ResourceQueueForDeletion(ctx context.Context, db *pg.DB, id string) (*Resource, error) {
 	res := &Resource{ID: id}

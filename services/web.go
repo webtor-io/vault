@@ -108,7 +108,7 @@ func (s *Web) router() *gin.Engine {
 	rg.PUT("/:id/uids", s.putResourceUIDs)
 	rg.GET("/:id", s.getResource)
 	rg.DELETE("/:id", s.deleteResource)
-	// files listing endpoint is not needed per requirements
+	rg.GET("/:id/files", s.getResourceFiles)
 
 	// WebSeed: /webseed/{id}/{path}
 	r.Any("/webseed/:id/*path", s.webSeed)
