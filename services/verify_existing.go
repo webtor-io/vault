@@ -16,6 +16,7 @@ import (
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
 	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/vault/services/uploads"
 )
 
 const (
@@ -146,6 +147,10 @@ func RunVerifyExisting(ctx context.Context, pgCl *cs.PG, s3c *cs.S3Client, api *
 
 	for ri := range resources {
 		r := &resources[ri]
+		if uploads.HomeHosted(r.ID) {
+			log.WithField("id", r.ID).Info("verify-existing: upload has no .torrent, nothing to verify against")
+			continue
+		}
 		stats.BytesScanned += r.TotalSize
 		log.WithFields(log.Fields{
 			"id":         r.ID,
