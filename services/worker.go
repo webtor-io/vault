@@ -606,6 +606,9 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	if err != nil {
 		return errors.Wrap(err, "failed to list resource content")
 	}
+	if len(fileItems) == 0 {
+		return errors.New("empty listing: nothing to store")
+	}
 	var totalSize int64
 	for _, item := range fileItems {
 		totalSize += item.Size
@@ -1132,7 +1135,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		Where("file.status = ?", StatusStored).
 		Limit(1).
 		Select()
-	if errors.Is(err, pg.ErrNoRows) {
+	if errors.Is(err, pg.ErrNoRows) && mi != nil {
 		sameResource = false
 		err = db.Model(&existing).
 			Context(ctx).
