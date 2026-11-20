@@ -25,6 +25,7 @@ import (
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
 	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/vault/services/uploads"
 )
 
 // Lease parameters for worker claim. See migration 8_resource_claim.up.sql
@@ -635,7 +636,8 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	// /{infohash}/source.torrent — we reuse the auth tokens already
 	// embedded in the first file's export URL to avoid resigning JWTs.
 	var mi *metainfo.Info
-	if s.verifyIntegrity && len(fileItems) > 0 {
+	// An upload has no .torrent to verify against.
+	if s.verifyIntegrity && !uploads.HomeHosted(id) {
 		ei, err := s.api.ExportResourceContent(ctx, cla, id, fileItems[0].ID)
 		if err != nil {
 			return errors.Wrap(err, "failed to export resource content for torrent fetch")

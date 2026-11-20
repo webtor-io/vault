@@ -150,6 +150,42 @@ func (s *Web) getResource(c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
+// ResourceFilesResponse is the body of GET /resource/{id}/files.
+type ResourceFilesResponse struct {
+	UIDs  []string              `json:"uids"`
+	Files []ResourceFileListing `json:"files"`
+}
+
+// GET /resource/{id}/files
+// getResourceFiles godoc
+// @Summary      List a stored resource's files
+// @Description  The pledgers' uids and the stored files, one per path in path order; a path is as listed, with a leading "/". 404 unless the resource is stored
+// @Tags         resource
+// @Produce      json
+// @Param        id   path      string  true  "Resource ID"
+// @Success      200  {object}  ResourceFilesResponse
+// @Failure      404
+// @Failure      500  {object}  ErrorResponse
+// @Router       /resource/{id}/files [get]
+func (s *Web) getResourceFiles(c *gin.Context) {
+	db := s.pg.Get()
+	if db == nil {
+		_ = c.Error(errors.New("DB not configured"))
+		return
+	}
+	ctx := c.Request.Context()
+	res, err := ResourceListStoredFiles(ctx, db, c.Param("id"))
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	if res == nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
 // DELETE /resource/{id} — queue deletion
 // deleteResource godoc
 // @Summary      Queue deletion of a resource

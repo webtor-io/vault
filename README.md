@@ -34,6 +34,7 @@ More flags (health/pprof/metrics, etc.) are provided by common-services.
 - PUT `/resource/{id}` — queue store, returns 202 with resource
 - PUT `/resource/{id}/uids` — replace the pledgers' uids, status unchanged; 404 when missing
 - GET `/resource/{id}` — fetch resource or 404
+- GET `/resource/{id}/files` — a stored resource's pledgers' uids and stored files (path, size), one per path; 404 unless stored
 - DELETE `/resource/{id}` — queue delete or cancel queued store
 - GET/HEAD `/webseed/{id}/{path}` — serve stored file with Range support
 

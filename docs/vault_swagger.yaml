@@ -38,6 +38,24 @@ definitions:
       updated_at:
         type: string
     type: object
+  services.ResourceFileListing:
+    properties:
+      path:
+        type: string
+      size:
+        type: integer
+    type: object
+  services.ResourceFilesResponse:
+    properties:
+      files:
+        items:
+          $ref: '#/definitions/services.ResourceFileListing'
+        type: array
+      uids:
+        items:
+          type: string
+        type: array
+    type: object
   services.Status:
     enum:
     - 0
@@ -147,6 +165,32 @@ paths:
           schema:
             $ref: '#/definitions/services.ErrorResponse'
       summary: Queue storing of a resource
+      tags:
+      - resource
+  /resource/{id}/files:
+    get:
+      description: The pledgers' uids and the stored files, one per path in path order;
+        a path is as listed, with a leading "/". 404 unless the resource is stored
+      parameters:
+      - description: Resource ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/services.ResourceFilesResponse'
+        "404":
+          description: Not Found
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/services.ErrorResponse'
+      summary: List a stored resource's files
       tags:
       - resource
   /resource/{id}/uids:
