@@ -1119,10 +1119,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 	db := s.pg.Get()
 	// Try to find an already stored file by matching resource_file.path and file.total_size
-	// This allows deduplication by common path and size across resources
 	// A file this resource already stored is reused as is; another
 	// resource's file with the same path and size can hold other content, so
-	// it is reused only when one of this torrent's pieces matches it.
+	// it is reused only when one of this torrent's pieces matches it, and
+	// without metainfo (mi == nil) it is not looked up at all.
 	var existing File
 	sameResource := true
 	err := db.Model(&existing).

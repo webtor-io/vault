@@ -42,6 +42,7 @@ func TestDoRequestPrivateTorrent(t *testing.T) {
 		{"empty 403", 403, ``, false},
 		{"private_unavailable", 403, `{"error":"x","code":"private_unavailable"}`, false},
 		{"store_outdated", 503, `{"error":"x","code":"store_outdated"}`, false},
+		{"not found", 404, `{"error":"not found"}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

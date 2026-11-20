@@ -6,6 +6,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -164,7 +165,7 @@ func TestFacts_RestoreAddsAndPrunes(t *testing.T) {
 
 // Q3: rest-api 404 on list (id unknown, e.g. after eviction) must not read as an
 // empty listing: the re-store fails and keeps the stored copy.
-func TestFacts_List404PrunesEverything(t *testing.T) {
+func TestFacts_List404KeepsStoredCopy(t *testing.T) {
 	files := twoFiles()
 	info, _, _ := buildTestTorrent(t, mib, files)
 	e := newStoreEnv(t, info, files)
@@ -176,9 +177,47 @@ func TestFacts_List404PrunesEverything(t *testing.T) {
 	l := links(e)
 	s := status(e)
 	t.Logf("store 2 err=%v links=%d status=%v objects=%d", err, len(l), s, len(e.s3.objects))
-	if err == nil && len(l) == 0 {
-		t.Errorf("404 listing wiped the stored copy: links=0 status=%v", s)
+	if err == nil || len(l) != 2 {
+		t.Errorf("404 listing: err=%v links=%d status=%v, want an error and both links kept", err, len(l), s)
 	}
+}
+
+// rest-api 404 on a later page of the listing (the id went away between two
+// calls) must not read as the end of the listing: the re-store fails and
+// keeps every file.
+func TestStore_List404OnSecondPageKeepsLinks(t *testing.T) {
+	files := twoFiles()
+	info, _, _ := buildTestTorrent(t, mib, files)
+	e := newStoreEnv(t, info, files)
+	if err := e.store(); err != nil {
+		t.Fatalf("store 1: %v", err)
+	}
+	// Page 1 is full (file a and 99 directories), page 2 is a 404.
+	h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/list") {
+			e.src.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Query().Get("offset") != "0" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		items := []map[string]any{{"id": "a", "path": "/t/a", "type": "file", "size": len(files[0].bytes)}}
+		for len(items) < 100 {
+			items = append(items, map[string]any{"type": "directory"})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	}))
+	t.Cleanup(h.Close)
+	e.w.api.url = h.URL
+	err := e.store()
+	if err == nil || !strings.Contains(err.Error(), "failed to list resource content") {
+		t.Fatalf("store 2: %v, want the listing failure", err)
+	}
+	if l := links(e); len(l) != 2 {
+		t.Errorf("links %v, want both kept", l)
+	}
+	e.assertStored(files)
 }
 
 // Review Focus: rest-api lists 200 with no files (an upload with every file
