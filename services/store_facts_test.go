@@ -50,7 +50,7 @@ func status(e *storeEnv) Status {
 	return r.Status
 }
 
-// Q1: verification on, no .torrent: the whole store fails.
+// Verification on, no .torrent: the whole store fails.
 func TestFacts_NoTorrentFailsStore(t *testing.T) {
 	files := []testFile{{"a", pattern(1, 2*mib+1)}}
 	info, _, _ := buildTestTorrent(t, mib, files)
@@ -63,7 +63,7 @@ func TestFacts_NoTorrentFailsStore(t *testing.T) {
 	t.Logf("error: %v", err)
 }
 
-// Q1: verification off (mi == nil): the same id stores fine.
+// Verification off (mi == nil): the same id stores fine.
 func TestFacts_NoMiStores(t *testing.T) {
 	files := twoFiles()
 	info, _, _ := buildTestTorrent(t, mib, files)
@@ -79,8 +79,9 @@ func TestFacts_NoMiStores(t *testing.T) {
 	}
 }
 
-// Q2: mi == nil, another resource holds the same path and size with other
-// bytes. Correct: the resource gets its own bytes. Fails on b8f14d6.
+// mi == nil, another resource holds the same path and size with other
+// bytes. Correct: the resource gets its own bytes. Fails without the
+// mi != nil guard on the cross-resource path+size lookup in storeFile.
 func TestFacts_NoMiCrossResourcePathSize(t *testing.T) {
 	files := []testFile{{"a", pattern(4, 6*mib+3)}}
 	info, _, _ := buildTestTorrent(t, mib, files)
@@ -105,7 +106,7 @@ func TestFacts_NoMiCrossResourcePathSize(t *testing.T) {
 	}
 }
 
-// Q3: PUT on a stored resource leaves it stored and nothing claims it.
+// PUT on a stored resource leaves it stored and nothing claims it.
 func TestFacts_PutStoredIsNoop(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
@@ -129,7 +130,7 @@ func TestFacts_PutStoredIsNoop(t *testing.T) {
 	}
 }
 
-// Q3: a re-store with a changed listing adds the new file, keeps the
+// A re-store with a changed listing adds the new file, keeps the
 // unchanged one without downloading it, prunes the removed one.
 func TestFacts_RestoreAddsAndPrunes(t *testing.T) {
 	a, b, c := testFile{"a", pattern(1, 3*mib+1)}, testFile{"b", pattern(2, 2*mib+7)}, testFile{"c", pattern(3, mib+5)}
@@ -163,7 +164,7 @@ func TestFacts_RestoreAddsAndPrunes(t *testing.T) {
 	t.Logf("opens on re-store: %v", e.src.opens)
 }
 
-// Q3: rest-api 404 on list (id unknown, e.g. after eviction) must not read as an
+// rest-api 404 on list (id unknown, e.g. after eviction) must not read as an
 // empty listing: the re-store fails and keeps the stored copy.
 func TestFacts_List404KeepsStoredCopy(t *testing.T) {
 	files := twoFiles()
@@ -220,8 +221,8 @@ func TestStore_List404OnSecondPageKeepsLinks(t *testing.T) {
 	e.assertStored(files)
 }
 
-// Review Focus: rest-api lists 200 with no files (an upload with every file
-// still in parts/): the re-store fails and keeps the stored copy.
+// rest-api lists 200 with no files (an upload with every file still in
+// parts/): the re-store fails and keeps the stored copy.
 func TestStore_EmptyListingKeepsLinks(t *testing.T) {
 	files := twoFiles()
 	info, _, _ := buildTestTorrent(t, mib, files)
@@ -240,8 +241,8 @@ func TestStore_EmptyListingKeepsLinks(t *testing.T) {
 	e.assertStored(files)
 }
 
-// Review Focus: with mi == nil the same bytes at the same path in another
-// resource still dedup, by content hash, without a full download.
+// With mi == nil the same bytes at the same path in another resource still
+// dedup, by content hash, without a full download.
 func TestStore_NoMiSameBytesDedupsByHash(t *testing.T) {
 	files := twoFiles()
 	info, _, _ := buildTestTorrent(t, mib, files)
