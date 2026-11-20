@@ -32,7 +32,7 @@ func TestGetResourceFiles(t *testing.T) {
 	}{
 		// uids keep their order; /N/a twice → first by file_hash (h1, 10); /N/c's file is not stored; no hashes
 		{"s", 200, `{"uids":["` + uid1 + `","` + uid0 + `"],"files":[{"path":"/N/a","size":10},{"path":"/N/b","size":20}]}`},
-		{"n", 200, `{"uids":[],"files":[]}`}, // Review Focus 5
+		{"n", 200, `{"uids":[],"files":[]}`}, // NULL uids, no files: empty arrays, not null
 		{"q0", 404, ""}, {"q1", 404, ""}, {"q3", 404, ""}, {"q4", 404, ""}, {"q5", 404, ""}, {"q6", 404, ""},
 		{"missing", 404, ""},
 	} {
