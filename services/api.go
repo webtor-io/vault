@@ -244,7 +244,9 @@ func (s *Api) doRequest(ctx context.Context, c *Claims, url string, method strin
 		}
 		return nil
 	} else if res.StatusCode == http.StatusNotFound {
-		return nil
+		// Never an empty answer: a listing cut short by a 404 would be
+		// stored as the whole resource.
+		return ErrNotFound
 	} else if res.StatusCode == http.StatusForbidden {
 		// The pinned rest-api module's ErrorResponse has no code or reason.
 		var e struct {
