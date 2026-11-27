@@ -124,6 +124,44 @@
                 }
             }
         },
+        "/resource/{id}/files": {
+            "get": {
+                "description": "The pledgers' uids and the stored files, one per path in path order; a path is as listed, with a leading \"/\". 404 unless the resource is stored",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "resource"
+                ],
+                "summary": "List a stored resource's files",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Resource ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/services.ResourceFilesResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found"
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/services.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/resource/{id}/uids": {
             "put": {
                 "description": "Replaces the uids the worker signs with, keeping their order. The status is not changed and a missing resource is not created. {}, null and [] clear the list",
@@ -309,6 +347,34 @@
                 },
                 "updated_at": {
                     "type": "string"
+                }
+            }
+        },
+        "services.ResourceFileListing": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                }
+            }
+        },
+        "services.ResourceFilesResponse": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/services.ResourceFileListing"
+                    }
+                },
+                "uids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },

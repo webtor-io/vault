@@ -32,7 +32,7 @@ The `serve` command initializes all components in order: PG connection → migra
 | File | Role |
 |------|------|
 | `web.go` | Gin HTTP server, routing, Swagger UI, error-to-status-code mapping |
-| `resource.go` | PUT/GET/DELETE `/resource/{id}` handlers — queue storage or deletion (202 Accepted) |
+| `resource.go` | PUT/GET/DELETE `/resource/{id}` handlers — queue storage or deletion (202 Accepted); `GET /resource/{id}/files` — a stored resource's uids and files, for the seeder after an upload's directory is evicted |
 | `webseed.go` | GET/HEAD `/webseed/{id}/{path}` — resolves `(id, path)` → S3 object hash; HEAD calls S3 directly, GET redirects to `${S3_CACHE_URL}/{hash}` if configured (single-tenant — bucket fixed in s3-cache config), else returns a presigned S3 URL |
 | `models.go` | Data models (`Resource`, `File`, `ResourceFile`, `OperationLog`) and go-pg DB helpers |
 | `worker.go` | Background job processor — polls DB every 5s, downloads from REST API, multipart-uploads to S3, publishes NATS events |

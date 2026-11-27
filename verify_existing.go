@@ -63,6 +63,7 @@ func verifyExisting(c *cli.Context) error {
 		"requeued":      stats.Requeued,
 		"s3_deleted":    stats.S3Deleted,
 		"errors":        stats.Errors,
+		"skipped":       stats.Skipped,
 		"bytes_scanned": stats.BytesScanned,
 		"dry_run":       opts.DryRun,
 	}).Info("verify-existing finished")
