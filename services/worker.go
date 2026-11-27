@@ -606,6 +606,9 @@ func (s *Worker) handleStore(ctx context.Context, db *pg.DB, id string) (err err
 	if err != nil {
 		return errors.Wrap(err, "failed to list resource content")
 	}
+	if len(fileItems) == 0 {
+		return errors.New("empty listing: nothing to store")
+	}
 	var totalSize int64
 	for _, item := range fileItems {
 		totalSize += item.Size
@@ -1116,10 +1119,10 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 	}
 	db := s.pg.Get()
 	// Try to find an already stored file by matching resource_file.path and file.total_size
-	// This allows deduplication by common path and size across resources
 	// A file this resource already stored is reused as is; another
 	// resource's file with the same path and size can hold other content, so
-	// it is reused only when one of this torrent's pieces matches it.
+	// it is reused only when one of this torrent's pieces matches it, and
+	// without metainfo (mi == nil) it is not looked up at all.
 	var existing File
 	sameResource := true
 	err := db.Model(&existing).
@@ -1132,7 +1135,7 @@ func (s *Worker) storeFile(ctx context.Context, cla *Claims, id string, item ra.
 		Where("file.status = ?", StatusStored).
 		Limit(1).
 		Select()
-	if errors.Is(err, pg.ErrNoRows) {
+	if errors.Is(err, pg.ErrNoRows) && mi != nil {
 		sameResource = false
 		err = db.Model(&existing).
 			Context(ctx).
