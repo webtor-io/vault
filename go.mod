@@ -18,7 +18,7 @@ require (
 	github.com/swaggo/swag v1.16.6
 	github.com/urfave/cli v1.22.17
 	github.com/webtor-io/common-services v0.0.0-20260927094256-ddfbf24ea805
-	github.com/webtor-io/rest-api v1.0.1-0.20261114123910-13c535326915
+	github.com/webtor-io/rest-api v1.0.1-0.20261127004127-bb03d3ca7f28
 )
 
 require (
@@ -103,7 +103,7 @@ require (
 	github.com/vmihailenco/tagparser v0.1.2 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/webtor-io/lazymap v0.0.0-20261021184726-55fd9cba3e7a // indirect
-	github.com/webtor-io/magnet2torrent v1.0.1-0.20261113103955-8de21226ede1 // indirect
+	github.com/webtor-io/magnet2torrent v1.0.1-0.20261114125219-733d1efe207c // indirect
 	github.com/webtor-io/torrent-store v1.1.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
